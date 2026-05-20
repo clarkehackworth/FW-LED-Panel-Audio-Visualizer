@@ -1,0 +1,4 @@
+numpy>=1.24
+sounddevice>=0.4.6
+pyserial>=3.5
+PyYAML>=6.0

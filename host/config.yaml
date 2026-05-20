@@ -1,0 +1,70 @@
+# Framework LED Matrix Audio Visualizer — configuration
+# All values shown are their defaults; uncomment and edit as needed.
+
+# ── Panels ────────────────────────────────────────────────────────────────────
+# Identify your panel ports with:  ls /dev/ttyACM*
+# Left and right are from the user's perspective looking at the laptop.
+
+left_panel:
+  port: /dev/ttyACM1
+  direction: right        # bars extend left-to-right
+  mirror: true           # flip bar direction (makes this panel a mirror image of right)
+  freq_start: top        # low frequencies at top column, high at bottom
+
+right_panel:
+  port: /dev/ttyACM0
+  direction: left        # bars extend left-to-right
+  mirror: true
+  freq_start: top        # low frequencies at top column, high at bottom
+
+# ── Audio source ──────────────────────────────────────────────────────────────
+audio:
+  # "auto" finds system audio automatically:
+  #   Linux  — first PulseAudio/PipeWire .monitor source via pactl
+  #   Windows — default output device via WASAPI loopback
+  # Use --list-devices to see device names/indices, then set the value here.
+  # On Windows, use the OUTPUT device name/index (not a microphone).
+  source: auto
+
+  # WASAPI loopback (Windows only): capture system output instead of mic.
+  # Defaults to true on Windows, false on other platforms. Set false to capture
+  # a microphone input even on Windows.
+  # wasapi_loopback: true
+
+  sample_rate: 44100     # Hz — must match the system sink rate
+  fft_size: 1024         # FFT window size (power of 2); larger = better frequency
+                         # resolution but higher latency
+
+# ── Visualization ─────────────────────────────────────────────────────────────
+visualization:
+  num_bars: 34           # frequency bands (1-34; each maps to one LED row)
+
+  freq_min: 60           # Hz — lower edge of the computed range
+  freq_max: 16000        # Hz — upper edge of the highest bar
+                         # Bands are distributed logarithmically between min/max.
+  bass_skip: 0          # discard this many bands from the bass end before displaying;
+                         # the remaining bands are scaled to fill all 34 display rows
+
+  # dB range mapped to full bar height.  Raise db_ceiling to compress loud peaks;
+  # lower db_floor to show quieter signals.
+  db_floor: -60          # dB — maps to bar length 0 (silence)
+  db_ceiling: -10        # dB — maps to bar length 8 (full)
+
+  # Smoothing: attack controls how fast bars rise; decay controls fall speed.
+  # Both are per-frame multipliers (higher = faster for attack, slower for decay).
+  scale: 4.0             # gamma/power curve exponent: 1.0 = linear, higher = pull down midrange
+                         # (the peak always stays at max; only sub-peak values are compressed)
+
+  attack: 0.5            # 0-1: fraction of new value blended in on the way up
+  decay: 0.5            # 0-1: fraction of current value kept each frame on the way down
+
+  target_fps: 30         # frames per second sent to panels
+
+  # Bar brightness gradient: base is always 255; tip fades to this value (0-255).
+  bar_fade_min: 0
+
+  # Peak indicators — a bright pixel that stays at the widest recent bar position.
+  peaks: true
+  peak_hold_frames: 15   # frames to hold at the peak before starting to fall
+  peak_fall_speed: 1.0   # columns per frame the peak dot retreats after hold expires
+  peak_fade_speed: 13.0   # brightness units per frame the peak dot fades (0-255 scale; 0 = no fade)

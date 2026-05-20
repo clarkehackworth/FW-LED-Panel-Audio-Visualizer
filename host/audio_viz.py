@@ -280,7 +280,7 @@ class AudioVisualizer:
     # Device discovery
     # ------------------------------------------------------------------
 
-    def _find_device(self):
+    def _find_device(self) -> Optional[object]:
         if self._source == "default":
             return None
         if self._source != "auto":
@@ -321,38 +321,19 @@ class AudioVisualizer:
         devices = sd.query_devices()
 
         # First: look for a monitor source in sounddevice's device list
-        for dev in devices:
-            name: str = dev["name"].lower()
-            if dev["max_input_channels"] > 0 and "monitor" in name:
-                print(f"  Auto-selected audio device: {dev['name']}")
-                return dev["index"]
+                for dev in devices:
+                    if dev["max_input_channels"] > 0 and "monitor" in dev["name"].lower():
+                        print(f"  Auto-selected audio device: {dev['name']}")
+                        return dev["index"]
 
-        # Second: enumerate all PulseAudio/PipeWire sources via pactl and probe each
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["pactl", "list", "short", "sources"],
-                capture_output=True, text=True, timeout=2,
-            )
-            monitor_sources = [
-                line.split()[1]
-                for line in result.stdout.splitlines()
-                if len(line.split()) >= 2 and ".monitor" in line.split()[1]
-            ]
-            for source in monitor_sources:
-                for rate in (self._sample_rate, 48000, 44100):
-                    try:
-                        sd.check_input_settings(device=source, channels=1, samplerate=rate)
-                        print(f"  Auto-selected monitor source: {source}")
-                        return source
-                    except Exception:
-                        continue
-        except Exception:
-            pass
+                for dev in devices:
+                    if dev["max_input_channels"] > 0:
+                        print(f"  Auto-selected usable input device (non-monitor): {dev['name']} (Index {dev['index']})")
+                        return dev["index"]
 
-        print("  Warning: no usable monitor source found — falling back to default input (microphone)")
-        print("  Tip: run --list-devices to see sounddevice inputs, or set audio.source in config.yaml")
-        return None
+                print("  Warning: no usable input device found — falling back to default input (microphone)")
+                print("  Tip: run --list-devices to see sounddevice inputs, or set audio.source in config.yaml")
+                return None
 
     # ------------------------------------------------------------------
     # Sample-rate negotiation

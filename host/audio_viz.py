@@ -33,19 +33,33 @@ Protocol (custom firmware commands):
 from __future__ import annotations
 
 import argparse
+
+import ctypes
+
 import glob
+
 import os
+
 import queue
+
 import sys
+
 import threading
+
 import time
+
 from contextlib import contextmanager
+
 from pathlib import Path
+
 from typing import Optional
 
 import numpy as np
+
 import serial
+
 import sounddevice as sd
+
 import yaml
 
 
@@ -223,6 +237,40 @@ def _is_microphone(name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# PortAudio re-init helper (forces device list refresh)
+# ---------------------------------------------------------------------------
+
+# Global lock to serialize PortAudio re-init with probe operations
+_pa_init_lock = threading.Lock()
+
+
+def _reinit_portaudio() -> bool:
+    """Re-initialize PortAudio to pick up new PipeWire devices.
+    
+    PortAudio caches the device list at init time. When new PipeWire nodes
+    appear (e.g., Firefox starts playing audio), we need to re-init to
+    see them. This is safe because probe() operations are synchronous
+    (open → measure → close) and never hold streams open.
+    
+    Returns True if re-init succeeded, False otherwise.
+    """
+    try:
+        lib = ctypes.CDLL("libportaudio.so")
+        ret = lib.Pa_Terminate()
+        if ret != 0:
+            print(f"  [portaudio] Pa_Terminate failed: {ret}")
+            return False
+        # Give PipeWire a moment to clean up the terminated context
+        time.sleep(0.1)
+        sd._initialized = False
+        sd._initialize()
+        return True
+    except Exception as e:
+        print(f"  [portaudio] re-init failed: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Audio device monitor (background auto-switching)
 # ---------------------------------------------------------------------------
 
@@ -393,7 +441,13 @@ class AudioMonitor:
 
         Returns (True if the probe list changed, set of new device indices).
         """
+        # Force PortAudio re-init to pick up new PipeWire devices (e.g. Firefox)
+        with _pa_init_lock:
+            _reinit_portaudio()
+
         devices = sd.query_devices()
+        all_input = [(d['index'], d['name']) for d in devices if d['max_input_channels'] > 0]
+        print(f"  [refresh] input devices={all_input}")
 
         # Build a set of candidate device indices (excluding the current one).
         current_idx = self._current_index
@@ -468,8 +522,6 @@ class AudioMonitor:
         if self._probes:
             known_indices.add(self._probes[0].device)
 
-        print(f"  [refresh] new_candidates={[n for _, n in new_candidates]}, known={known_indices}")
-
         for idx, name in new_candidates:
             if idx in known_indices:
                 probe = old_candidate_map.get(idx)
@@ -511,6 +563,7 @@ class AudioMonitor:
         self._switch_event = threading.Event()
         self._running = True
         self._last_refresh = time.monotonic()
+        print(f"  [monitor] refresh_interval={self._refresh_interval}s, probe_map={self._probe_map is not None}, probes={len(self._probes)}")
 
         while self._running:
             # Wait for interval

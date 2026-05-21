@@ -242,72 +242,67 @@ class _ProbeDevice:
     # -- probing via short-lived stream --------------------------------
 
     def probe(self) -> float:
-        """Open a short-lived stream, read energy, return RMS level."""
+        """Open a short-lived stream, read energy, return RMS level.
+
+        Runs in a background thread with a 3-second timeout to prevent
+        hanging on devices that can't be opened.
+        """
         buf = []
+        result = {"energy": 0.0, "done": False}
 
         def _cb(indata, frames, time_info, status):
             buf.append(indata[:, 0].copy())
 
-        stream = None
-        # Suppress PortAudio/ALSA error messages at the C-level (fd 2).
-        # PortAudio writes via vfprintf(stderr, ...) which bypasses Python's sys.stderr.
-        with _suppress_stderr():
+        def _do_probe():
+            stream = None
             try:
-                # Try multiple sample rates — devices rarely match the config rate exactly
-                for rate in (self._sample_rate, 48000, 44100, 48001, 44101):
-                    if stream is not None:
+                with _suppress_stderr():
+                    for rate in (self._sample_rate, 48000, 44100, 48001, 44101):
+                        if stream is not None:
+                            try:
+                                stream.stop()
+                                stream.close()
+                            except Exception:
+                                pass
                         try:
-                            stream.stop()
-                            stream.close()
+                            stream = sd.InputStream(
+                                device=self.device,
+                                channels=1,
+                                samplerate=rate,
+                                blocksize=256,
+                                dtype=np.float32,
+                                callback=_cb,
+                            )
+                            stream.start()
+                            break
                         except Exception:
-                            pass
-                    try:
-                        stream = sd.InputStream(
-                            device=self.device,
-                            channels=1,
-                            samplerate=rate,
-                            blocksize=256,
-                            dtype=np.float32,
-                            callback=_cb,
-                        )
-                        stream.start()
-                        break  # success
-                    except Exception:
-                        stream = None  # type: ignore[assignment]
-                else:
-                    return 0.0
+                            stream = None
+                    else:
+                        return
 
-                # Let it run for ~0.5 s — longer probes cause PipeWire tap thrashing
-                # and prevent all candidates from being probed within the interval.
-                time.sleep(0.5)
+                    time.sleep(0.5)
 
-                stream.stop()
-                stream.close()
-                stream = None
+                    stream.stop()
+                    stream.close()
+                    stream = None
 
-                if not buf:
-                    return 0.0
-                samples = np.concatenate(buf)
-                energy = float(np.sqrt(np.mean(samples ** 2)))
-                now = time.monotonic()
-                # Update shared state under lock
-                with self._lock:
-                    self._energy = energy
-                    self._updated = now
-                    if energy > 1e-6:
-                        self._last_active = now
-                return energy
-
+                    if buf:
+                        samples = np.concatenate(buf)
+                        energy = float(np.sqrt(np.mean(samples ** 2)))
+                        now = time.monotonic()
+                        with self._lock:
+                            self._energy = energy
+                            self._updated = now
+                            if energy > 1e-6:
+                                self._last_active = now
+                        result["energy"] = energy
             except Exception:
-                return 0.
-            finally:
-                # Always clean up the stream if it was created
-                if stream is not None:
-                    try:
-                        stream.stop()
-                        stream.close()
-                    except Exception:
-                        pass
+                pass
+
+        t = threading.Thread(target=_do_probe, daemon=True)
+        t.start()
+        t.join(timeout=3.0)
+        return result["energy"]
 
     @property
     def energy(self) -> float:
@@ -389,10 +384,10 @@ class AudioMonitor:
 
     # -- device list refresh ----------------------------------------------
 
-    def _refresh_devices(self, probe_map: dict) -> bool:
+    def _refresh_devices(self, probe_map: dict) -> tuple[bool, set]:
         """Re-query the system for audio devices and rebuild the probe list.
 
-        Returns True if the probe list changed (devices added or removed).
+        Returns (True if the probe list changed, set of new device indices).
         """
         devices = sd.query_devices()
 
@@ -414,6 +409,7 @@ class AudioMonitor:
         # Separate current device from candidates.
         new_probes: list[_ProbeDevice] = []
         candidates_added = False
+        new_device_indices: set = set()
 
         # Check if current device still exists.
         current_still_present = False
@@ -440,12 +436,18 @@ class AudioMonitor:
             # Rebuild probe_map with the new current device.
             probe_map.clear()
             probe_map[fallback_idx] = new_probe
+            for idx, name in new_candidates:
+                probe = _ProbeDevice(idx, self._sample_rate, self._fft_size)
+                probe.name = name
+                probe_map[idx] = probe
             self._probes = [new_probe] + [probe_map[idx] for idx, _ in new_candidates]
             self._current_index = 0
+            for idx, _ in new_candidates:
+                new_device_indices.add(idx)
             # Signal the main loop to switch to the new current device.
             if self._switch_event is not None:
                 self._switch_event.set()
-            return True  # map changed
+            return True, new_device_indices
 
         # Start with the current probe.
         if self._probes:
@@ -463,11 +465,12 @@ class AudioMonitor:
                 probe.name = name  # update name in case it changed
                 new_probes.append(probe)
             else:
-                # New device — create a fresh probe.
+                # Genuinely new device — create a fresh probe.
                 probe = _ProbeDevice(idx, self._sample_rate, self._fft_size)
                 probe.name = name
                 new_probes.append(probe)
                 candidates_added = True
+                new_device_indices.add(idx)
                 probe_map[idx] = probe
 
         # Remove probes for devices that no longer exist.
@@ -480,7 +483,7 @@ class AudioMonitor:
         # Update the probe list (keeping current probe at index 0).
         self._probes = new_probes
 
-        return candidates_added or len(old_candidates) != len(new_candidates) - 1
+        return candidates_added or len(old_candidates) != len(new_candidates) - 1, new_device_indices
 
     # -- the background worker thread -------------------------------------
 
@@ -498,11 +501,15 @@ class AudioMonitor:
 
             # Periodically refresh the device list to pick up new/disconnected devices.
             now = time.monotonic()
+
+            # Periodically refresh the device list to pick up new/disconnected devices.
+            device_changed = False
+            new_devices: set = set()
             if (self._probe_map is not None and
                     now - self._last_refresh >= self._refresh_interval):
-                changed = self._refresh_devices(self._probe_map)
-                if changed:
-                    print("  Device list changed, re-probing...")
+                device_changed, new_devices = self._refresh_devices(self._probe_map)
+                if device_changed:
+                    print(f"  Device list changed, probing candidates... (changed={device_changed}, new={new_devices})")
                 self._last_refresh = now
 
             if self._current_index >= len(self._probes):
@@ -521,41 +528,58 @@ class AudioMonitor:
 
             current_db = self._rms_to_db(current_probe.energy)
 
-            if not can_switch:
-                # Current device is still active — skip probing, no output.
-                continue
-
-            # Current device has been silent — probe candidates.
-            print(f"  {current_probe.name} silent, probing candidates...")
-            self._probe_all()
-
-            print(f"  Auto-switch levels: {current_probe.name}={current_db:.1f} dB "
-                  f"(silent, probing candidates)")
-
-            best_idx = self._current_index
-            best_db = current_db
-
-            for i, probe in enumerate(self._probes):
-                if i == self._current_index:
-                    continue
-                p_db = self._rms_to_db(probe.energy)
-                print(f", {probe.name[:20]}={p_db:.1f} dB", end="")
-                if p_db > best_db and p_db > self._rms_to_db(self._threshold):
-                    best_idx = i
-                    best_db = p_db
-            print()
-
-            if best_idx != self._current_index:
-                margin_db = best_db - current_db
-                if margin_db >= self._hysteresis_db:
-                    current_name = current_probe.name
-                    new_name = self._probes[best_idx].name
-                    print(f"  Auto-switch: {current_name} -> {new_name} "
-                          f"({current_db:.1f} dB -> {best_db:.1f} dB)")
-                    self._current_index = best_idx
-                    self._switch_event.set()  # notify main loop
+            # Probe when device list changed or current device has been silent.
+            if device_changed or can_switch:
+                if device_changed:
+                    print(f"  Device list changed, probing candidates...")
                 else:
-                    print(f"    (no candidate loud enough by {self._hysteresis_db:.0f} dB)")
+                    print(f"  {current_probe.name} silent, probing candidates...")
+
+                self._probe_all()
+
+                best_idx = self._current_index
+                best_db = current_db
+
+                for i, probe in enumerate(self._probes):
+                    if i == self._current_index:
+                        continue
+                    p_db = self._rms_to_db(probe.energy)
+                    print(f", {probe.name[:20]}={p_db:.1f} dB", end="")
+                    if p_db > best_db and p_db > self._rms_to_db(self._threshold):
+                        best_idx = i
+                        best_db = p_db
+                print()
+
+                switch = False
+                if device_changed and new_devices:
+                    # Device list changed + new devices found — switch to the
+                    # first new device.
+                    for probe in self._probes:
+                        if probe.device in new_devices:
+                            current_name = current_probe.name
+                            new_name = probe.name
+                            print(f"  Auto-switch (new device): {current_name} -> {new_name}")
+                            self._current_index = self._probes.index(probe)
+                            self._switch_event.set()
+                            switch = True
+                            break
+                    if not switch:
+                        print(f"    (no new device indices found — keeping current)")
+                elif best_idx != self._current_index:
+                    margin_db = best_db - current_db
+                    if margin_db >= self._hysteresis_db:
+                        current_name = current_probe.name
+                        new_name = self._probes[best_idx].name
+                        print(f"  Auto-switch: {current_name} -> {new_name} "
+                              f"({current_db:.1f} dB -> {best_db:.1f} dB)")
+                        self._current_index = best_idx
+                        self._switch_event.set()
+                        switch = True
+                    else:
+                        print(f"    (no candidate loud enough by {self._hysteresis_db:.0f} dB)")
+            else:
+                # Current device still active — skip probing, no output.
+                continue
 
     # -- public API -------------------------------------------------------
 

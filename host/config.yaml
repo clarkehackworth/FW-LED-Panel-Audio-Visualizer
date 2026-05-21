@@ -20,10 +20,40 @@ right_panel:
 # ── Audio source ──────────────────────────────────────────────────────────────
 audio:
   # "auto" finds system audio automatically:
-  #   Linux  — first PulseAudio/PipeWire .monitor source via pactl
+  #   Linux  — best-known PipeWire tap source (Easy Effects Sink,
+  #            Equalizer, Firefox, etc.) from sounddevice's device list
   #   Windows — default output device via WASAPI loopback
   # Use --list-devices to see device names/indices, then set the value here.
   # On Windows, use the OUTPUT device name/index (not a microphone).
+
+  # When auto_switch is true, the visualizer will scan all available input
+  # devices for audio activity while running. If it detects a stronger signal
+  # on another device, it will automatically switch to that device.
+  # Enabled by default; use --no-auto-switch to disable.
+  auto_switch: true
+
+  # Energy threshold (dB relative to full scale) above which a device is
+  # considered to have "active" audio.  Must be below db_ceiling.
+  # auto_switch_threshold: -50
+
+  # How many dB louder the new device must be vs. the current one to trigger
+  # a switch (prevents rapid flipping between similarly-loud devices).
+  # auto_switch_hysteresis: 6
+
+  # How many seconds the current device must show no signal before the
+  # monitor considers switching to another device.  Prevents flickering
+  # between devices when the active signal is intermittent.
+  # auto_switch_persistence: 60
+
+  # Probe interval in seconds — how often audio levels are checked on other
+  # devices.  The stream is paused during the brief probe window.
+  # auto_switch_interval: 5
+
+   # By default, microphone devices are excluded from auto-switch candidates.
+   # Set true to include them (e.g. when you want the visualizer to respond
+   # to mic input instead of system audio).
+   # allow_mics: false
+
   source: auto
 
   # WASAPI loopback (Windows only): capture system output instead of mic.
@@ -33,7 +63,7 @@ audio:
 
   sample_rate: 44100     # Hz — must match the system sink rate
   fft_size: 1024         # FFT window size (power of 2); larger = better frequency
-                         # resolution but higher latency
+                          # resolution but higher latency
 
 # ── Visualization ─────────────────────────────────────────────────────────────
 visualization:
@@ -52,7 +82,7 @@ visualization:
 
   # Smoothing: attack controls how fast bars rise; decay controls fall speed.
   # Both are per-frame multipliers (higher = faster for attack, slower for decay).
-  scale: 4.0             # gamma/power curve exponent: 1.0 = linear, higher = pull down midrange
+  scale: 16.0             # gamma/power curve exponent: 1.0 = linear, higher = pull down midrange
                          # (the peak always stays at max; only sub-peak values are compressed)
 
   attack: 0.5            # 0-1: fraction of new value blended in on the way up
@@ -61,10 +91,10 @@ visualization:
   target_fps: 30         # frames per second sent to panels
 
   # Bar brightness gradient: base is always 255; tip fades to this value (0-255).
-  bar_fade_min: 0
+  bar_fade_min: 40
 
   # Peak indicators — a bright pixel that stays at the widest recent bar position.
-  peaks: true
+  peaks: false 
   peak_hold_frames: 15   # frames to hold at the peak before starting to fall
   peak_fall_speed: 1.0   # columns per frame the peak dot retreats after hold expires
   peak_fade_speed: 13.0   # brightness units per frame the peak dot fades (0-255 scale; 0 = no fade)

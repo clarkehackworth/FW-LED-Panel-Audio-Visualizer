@@ -8,9 +8,10 @@ one or two Framework LED matrix panels.
 Requires custom firmware built with firmware/setup.sh.
 
 Platform support:
-  Linux  — auto-detects PulseAudio/PipeWire monitor source via pactl
+  Linux  — auto-detects PipeWire tap sources (e.g. "Easy Effects Sink",
+               "Equalizer (Speakers)") for system audio capture
   Windows — auto-detects default output device via WASAPI loopback
-              (set audio.wasapi_loopback: false in config to use mic instead)
+               (set audio.wasapi_loopback: false in config to use mic instead)
 
 Usage:
     python3 audio_viz.py [--config config.yaml] [options]
@@ -32,10 +33,12 @@ Protocol (custom firmware commands):
 from __future__ import annotations
 
 import argparse
+import os
 import queue
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -43,6 +46,28 @@ import numpy as np
 import serial
 import sounddevice as sd
 import yaml
+
+
+# ---------------------------------------------------------------------------
+# PortAudio/ALSA error suppression
+# ---------------------------------------------------------------------------
+# PortAudio writes error messages directly to C-level stderr (fd 2) via
+# vfprintf(stderr, ...), which bypasses Python's sys.stderr entirely.
+# We must redirect at the raw file descriptor level using os.dup2.
+
+@contextmanager
+def _suppress_stderr():
+    """Silence PortAudio/ALSA errors at the C-level stderr (fd 2)."""
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    old_fd2 = os.dup(2)
+    try:
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        os.dup2(old_fd2, 2)
+        os.close(devnull_fd)
+        os.close(old_fd2)
+
 
 # ---------------------------------------------------------------------------
 # Protocol constants
@@ -174,11 +199,291 @@ def make_log_bins(n_bars: int, freq_min: float, freq_max: float,
 
 
 # ---------------------------------------------------------------------------
+# Microphone detection helpers
+# ---------------------------------------------------------------------------
+
+_MICROPHONE_PATTERNS = [
+    "mic",
+    "microphone",
+    "alsa_input",
+    "pulse_input",
+]
+
+def _is_microphone(name: str) -> bool:
+    """Return True if *name* looks like a microphone / capture device."""
+    lower = name.lower()
+    for pat in _MICROPHONE_PATTERNS:
+        if pat in lower:
+            return True
+    # Also flag devices that are purely "Default" input without "loopback" or "tap"
+    if lower == "default" or lower.startswith("default input"):
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Audio device monitor (background auto-switching)
+# ---------------------------------------------------------------------------
+
+class _ProbeDevice:
+    """Monitors a single audio input device for signal energy."""
+
+    def __init__(self, device, sample_rate: int, fft_size: int) -> None:
+        self.device = device
+        self._sample_rate = sample_rate
+        self._fft_size = fft_size
+        self._device_name = ""
+        self._lock = threading.Lock()
+        self._energy = 0.0
+        self._updated = 0.0
+        self._last_active = 0.0  # monotonic time of last energy > threshold
+
+    # -- probing via short-lived stream --------------------------------
+
+    def probe(self) -> float:
+        """Open a short-lived stream, read energy, return RMS level."""
+        buf = []
+
+        def _cb(indata, frames, time_info, status):
+            buf.append(indata[:, 0].copy())
+
+        stream = None
+        # Suppress PortAudio/ALSA error messages at the C-level (fd 2).
+        # PortAudio writes via vfprintf(stderr, ...) which bypasses Python's sys.stderr.
+        with _suppress_stderr():
+            try:
+                # Try multiple sample rates — devices rarely match the config rate exactly
+                for rate in (self._sample_rate, 48000, 44100, 48001, 44101):
+                    if stream is not None:
+                        try:
+                            stream.stop()
+                            stream.close()
+                        except Exception:
+                            pass
+                    try:
+                        stream = sd.InputStream(
+                            device=self.device,
+                            channels=1,
+                            samplerate=rate,
+                            blocksize=256,
+                            dtype=np.float32,
+                            callback=_cb,
+                        )
+                        stream.start()
+                        break  # success
+                    except Exception:
+                        stream = None  # type: ignore[assignment]
+                else:
+                    return 0.0
+
+                # Let it run for ~0.5 s — longer probes cause PipeWire tap thrashing
+                # and prevent all candidates from being probed within the interval.
+                time.sleep(0.5)
+
+                stream.stop()
+                stream.close()
+                stream = None
+
+                if not buf:
+                    return 0.0
+                samples = np.concatenate(buf)
+                energy = float(np.sqrt(np.mean(samples ** 2)))
+                now = time.monotonic()
+                # Update shared state under lock
+                with self._lock:
+                    self._energy = energy
+                    self._updated = now
+                    if energy > 1e-6:
+                        self._last_active = now
+                return energy
+
+            except Exception:
+                return 0.
+            finally:
+                # Always clean up the stream if it was created
+                if stream is not None:
+                    try:
+                        stream.stop()
+                        stream.close()
+                    except Exception:
+                        pass
+
+    @property
+    def energy(self) -> float:
+        with self._lock:
+            return self._energy
+
+    @property
+    def updated(self) -> float:
+        with self._lock:
+            return self._updated
+
+    @property
+    def name(self) -> str:
+        return self._device_name
+
+    @name.setter
+    def name(self, value: str) -> None:
+        self._device_name = value
+
+
+class AudioMonitor:
+    """
+    Background monitor that listens on multiple audio devices and detects
+    which one has the strongest audio signal.  Used to auto-switch the
+    main visualizer stream when a louder source becomes available.
+    """
+
+    def __init__(
+        self,
+        probe_devices: list[_ProbeDevice],
+        current_device,
+        sample_rate: int,
+        threshold: float = 1e-3,       # ~ -60 dBFS
+        hysteresis_db: float = 6.0,    # dB margin before switching
+        persistence_timeout: float = 60.0,  # seconds of silence before considering switch
+    ) -> None:
+        self._probes = probe_devices
+        self._current = current_device
+        self._threshold = threshold
+        self._hysteresis_db = hysteresis_db
+        self._persistence_timeout = persistence_timeout
+        self._switch_event: Optional[threading.Event] = None
+
+    # -- helpers ----------------------------------------------------------
+
+    @staticmethod
+    def _rms_to_db(rms: float) -> float:
+        """Convert RMS (0-1) to dBFS."""
+        if rms < 1e-10:
+            return -100.0
+        return 20.0 * np.log10(rms)
+
+    @staticmethod
+    def _db_to_linear(db: float) -> float:
+        """Convert dBFS back to RMS."""
+        return 10.0 ** (db / 20.0)
+
+    # -- probing ----------------------------------------------------------
+
+    def _probe_all(self) -> None:
+        """Probe every non-current device via short-lived streams."""
+        current_idx = self._current_index
+        for i, probe in enumerate(self._probes):
+            if i == current_idx:
+                continue  # skip the device we're already listening on
+            probe.probe()
+
+    # -- the background worker thread -------------------------------------
+
+    def _run(self) -> None:
+        self._switch_event = threading.Event()
+        self._running = True
+
+        while self._running:
+            # Wait for interval
+            self._switch_event.wait(self._interval)
+
+            if not self._running:
+                break
+
+            if self._current_index >= len(self._probes):
+                continue
+
+            now = time.monotonic()
+            current_probe = self._probes[self._current_index]
+
+            # --- persistence / locking ---
+            # Only consider switching if the current device has been silent
+            # for longer than the persistence timeout.  While the current
+            # device is still active, we do NOT probe other devices.
+            with current_probe._lock:
+                current_silence = (now - current_probe._last_active
+                                   if current_probe._last_active > 0 else float('inf'))
+            can_switch = current_silence >= self._persistence_timeout
+
+            current_db = self._rms_to_db(current_probe.energy)
+
+            if not can_switch:
+                # Current device is still active — skip probing, no output.
+                continue
+
+            # Current device has been silent — probe candidates.
+            print(f"  {current_probe.name} silent, probing candidates...")
+            self._probe_all()
+
+            print(f"  Auto-switch levels: {current_probe.name}={current_db:.1f} dB "
+                  f"(silent, probing candidates)")
+
+            best_idx = self._current_index
+            best_db = current_db
+
+            for i, probe in enumerate(self._probes):
+                if i == self._current_index:
+                    continue
+                p_db = self._rms_to_db(probe.energy)
+                print(f", {probe.name[:20]}={p_db:.1f} dB", end="")
+                if p_db > best_db and p_db > self._rms_to_db(self._threshold):
+                    best_idx = i
+                    best_db = p_db
+            print()
+
+            if best_idx != self._current_index:
+                margin_db = best_db - current_db
+                if margin_db >= self._hysteresis_db:
+                    current_name = current_probe.name
+                    new_name = self._probes[best_idx].name
+                    print(f"  Auto-switch: {current_name} -> {new_name} "
+                          f"({current_db:.1f} dB -> {best_db:.1f} dB)")
+                    self._current_index = best_idx
+                    self._switch_event.set()  # notify main loop
+                else:
+                    print(f"    (no candidate loud enough by {self._hysteresis_db:.0f} dB)")
+
+    # -- public API -------------------------------------------------------
+
+    @property
+    def interval(self) -> float:
+        return self._interval
+
+    @interval.setter
+    def interval(self, value: float) -> None:
+        self._interval = value
+
+    @property
+    def current_index(self) -> int:
+        return self._current_index
+
+    @current_index.setter
+    def current_index(self, value: int) -> None:
+        self._current_index = value
+
+    def start(self) -> threading.Thread:
+        self._interval = 5.0  # default interval in seconds
+        self._current_index = 0
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="audio-monitor")
+        self._thread.start()
+        return self._thread
+
+    def stop(self) -> None:
+        self._running = False
+
+    def wait_for_switch(self, timeout: float | None = None) -> bool:
+        """Check (non-blocking when timeout=0) for a switch event.
+        Returns True and clears the event if a switch was signalled.
+        """
+        if self._switch_event is None:
+            return False
+        return self._switch_event.wait(timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
 # Main visualizer
 # ---------------------------------------------------------------------------
 
 class AudioVisualizer:
-    def __init__(self, cfg: dict) -> None:
+    def __init__(self, cfg: dict, auto_switch: bool = True, allow_mics: bool = False) -> None:
         viz = cfg.get("visualization", {})
         audio = cfg.get("audio", {})
 
@@ -205,6 +510,15 @@ class AudioVisualizer:
         default_loopback = sys.platform == "win32"
         self._wasapi_loopback: bool = bool(audio.get("wasapi_loopback", default_loopback))
 
+        # Auto-switch settings
+        self._auto_switch: bool = auto_switch
+        self._auto_switch_threshold: float = float(audio.get("auto_switch_threshold", -50))
+        self._auto_switch_hysteresis: float = float(audio.get("auto_switch_hysteresis", 6))
+        self._auto_switch_persistence: float = float(audio.get("auto_switch_persistence", 60))
+        self._auto_switch_interval: float = float(audio.get("auto_switch_interval", 5))
+        # CLI flag wins; config sets default
+        self._allow_mics: bool = allow_mics or bool(audio.get("allow_mics", False))
+
         # Pre-computed state
         self._bass_skip: int = int(viz.get("bass_skip", 6))
 
@@ -220,6 +534,9 @@ class AudioVisualizer:
         # Audio ring buffer (filled by callback, drained by main thread)
         self._ring = np.zeros(self._fft_size, dtype=np.float32)
         self._audio_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=8)
+
+        # Current probe for auto-switch energy tracking (set before stream open)
+        self._current_probe: Optional[_ProbeDevice] = None
 
         # Panels
         ext_map  = {"left": 0, "right": 1}   # bar extension direction
@@ -246,6 +563,16 @@ class AudioVisualizer:
             self._audio_q.put_nowait(mono.copy())
         except queue.Full:
             pass  # drop chunk — main loop is behind, visual glitch is acceptable
+
+        # Track current device energy for auto-switch comparison
+        if self._current_probe is not None:
+            energy = float(np.sqrt(np.mean(mono ** 2)))
+            now = time.monotonic()
+            with self._current_probe._lock:
+                self._current_probe._energy = energy
+                self._current_probe._updated = now
+                if energy > 1e-6:
+                    self._current_probe._last_active = now
 
     # ------------------------------------------------------------------
     # FFT + bar computation
@@ -317,42 +644,68 @@ class AudioVisualizer:
         return None
 
     def _find_device_monitor(self) -> Optional[object]:
-        """Find a PulseAudio/PipeWire monitor source (Linux/macOS)."""
+        """Find a PipeWire tap source for system audio capture (Linux).
+
+        PipeWire tap sources appear in sounddevice's device list with
+        descriptive names (e.g. "Easy Effects Sink", "Equalizer (Speakers)")
+        but do NOT contain "monitor" in their name.  pactl .monitor names
+        are NOT usable with sounddevice.
+        """
         devices = sd.query_devices()
 
-        # First: look for a monitor source in sounddevice's device list
-        for dev in devices:
-            name: str = dev["name"].lower()
-            if dev["max_input_channels"] > 0 and "monitor" in name:
-                print(f"  Auto-selected audio device: {dev['name']}")
-                return dev["index"]
+        # Priority list of well-known PipeWire tap source names for
+        # capturing system audio (the sink/tap that has the full mix).
+        priority_names = [
+            "easy effects sink",
+            "easyeffects sink",
+            "equalizer",
+            "output level meter",
+            "firefox",
+            "chromium",
+        ]
 
-        # Second: enumerate all PulseAudio/PipeWire sources via pactl and probe each
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["pactl", "list", "short", "sources"],
-                capture_output=True, text=True, timeout=2,
-            )
-            monitor_sources = [
-                line.split()[1]
-                for line in result.stdout.splitlines()
-                if len(line.split()) >= 2 and ".monitor" in line.split()[1]
-            ]
-            for source in monitor_sources:
-                for rate in (self._sample_rate, 48000, 44100):
-                    try:
-                        sd.check_input_settings(device=source, channels=1, samplerate=rate)
-                        print(f"  Auto-selected monitor source: {source}")
-                        return source
-                    except Exception:
-                        continue
-        except Exception:
-            pass
+        # Iterate priority list first — pick the best-known tap source.
+        for pri in priority_names:
+            for dev in devices:
+                if dev["max_input_channels"] == 0:
+                    continue
+                if pri in dev["name"].lower():
+                    print(f"  Auto-selected audio device: {dev['name']}")
+                    return dev["index"]
+
+        # Fallback: any PipeWire tap with input channels (but not
+        # the generic "pipewire" or "default" proxy, and not a microphone).
+        for dev in devices:
+            if dev["max_input_channels"] == 0:
+                continue
+            name_lower = dev["name"].lower()
+            if name_lower in ("pipewire", "default"):
+                continue
+            if not self._allow_mics and _is_microphone(dev["name"]):
+                continue
+            print(f"  Auto-selected audio device (fallback): {dev['name']}")
+            return dev["index"]
 
         print("  Warning: no usable monitor source found — falling back to default input (microphone)")
         print("  Tip: run --list-devices to see sounddevice inputs, or set audio.source in config.yaml")
         return None
+
+    def _find_candidate_devices(self, exclude: object) -> list[tuple[object, str]]:
+        """
+        Return a list of (device, name) tuples for all usable input devices,
+        excluding *exclude*.  Microphone devices are excluded by default;
+        use --allow-mics to include them.
+        """
+        candidates: list[tuple[object, str]] = []
+        devices = sd.query_devices()
+        for dev in devices:
+            if dev["index"] == exclude or dev["max_input_channels"] == 0:
+                continue
+            if not self._allow_mics and _is_microphone(dev["name"]):
+                continue
+            candidates.append((dev["index"], dev["name"]))
+
+        return candidates
 
     # ------------------------------------------------------------------
     # Sample-rate negotiation
@@ -393,6 +746,73 @@ class AudioVisualizer:
         return native
 
     # ------------------------------------------------------------------
+    # Stream management
+    # ------------------------------------------------------------------
+
+    def _open_stream(self, device, sample_rate: int):
+        """Open and start the main audio InputStream.
+
+        Tries multiple sample rates because some ALSA devices report a native
+        rate they don't actually support.
+
+        Returns (stream, actual_rate).
+        """
+        # Suppress PortAudio/ALSA error messages at the C-level (fd 2).
+        # PortAudio writes via vfprintf(stderr, ...) which bypasses Python's sys.stderr.
+        with _suppress_stderr():
+            extra = sd.WasapiSettings(loopback=True) if self._wasapi_loopback else None
+            candidates = (sample_rate, 48000, 44100, 48001, 44101)
+            for rate in candidates:
+                try:
+                    stream = sd.InputStream(
+                        device=device,
+                        channels=1,
+                        samplerate=rate,
+                        blocksize=256,
+                        dtype=np.float32,
+                        callback=self._audio_callback,
+                        extra_settings=extra,
+                    )
+                    stream.start()
+                    return stream, rate
+                except Exception:
+                    pass
+            # None of the rates worked — raise the last error
+            stream = sd.InputStream(
+                device=device,
+                channels=1,
+                samplerate=sample_rate,
+                blocksize=256,
+                dtype=np.float32,
+                callback=self._audio_callback,
+                extra_settings=extra,
+            )
+            stream.start()
+            return stream, sample_rate
+
+    def _switch_device(self, new_device, new_device_name: str) -> None:
+        """Close current stream, resolve sample rate for new device, reopen stream."""
+        # Close the old stream FIRST so ALSA releases the device handle.
+        if self._stream is not None:
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+        sample_rate = self._resolve_sample_rate(new_device)
+        self._ring = np.zeros(self._fft_size, dtype=np.float32)
+        self._smooth[:] = 0.0
+        stream, actual_rate = self._open_stream(new_device, sample_rate)
+        self._stream = stream
+        if actual_rate != sample_rate:
+            print(f"  Sample rate {sample_rate} Hz not supported — using {actual_rate} Hz")
+            self._sample_rate = actual_rate
+            all_masks = make_log_bins(
+                self._num_bars + self._bass_skip, self._freq_min, self._freq_max,
+                self._fft_size, actual_rate,
+            )
+            self._bin_masks = all_masks[self._bass_skip:]
+
+    # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
@@ -409,53 +829,118 @@ class AudioVisualizer:
         sample_rate = self._resolve_sample_rate(device)
         frame_interval = 1.0 / self._target_fps
 
-        extra = sd.WasapiSettings(loopback=True) if self._wasapi_loopback else None
+        # Build probes FIRST so the callback can track energy from the start
+        current_probe: Optional[_ProbeDevice] = None
+        monitor: Optional[AudioMonitor] = None
+        monitor_thread: Optional[threading.Thread] = None
+        probe_map: dict[object, _ProbeDevice] = {}
+
+        if self._auto_switch:
+            candidates = self._find_candidate_devices(device)
+            if candidates:
+                current_probe = _ProbeDevice(device, self._sample_rate, self._fft_size)
+                try:
+                    info = sd.query_devices(device, kind="input")
+                    current_probe.name = info["name"]
+                except Exception:
+                    current_probe.name = str(device)
+                probe_map[device] = current_probe
+
+                for dev_idx, dev_name in candidates:
+                    probe = _ProbeDevice(dev_idx, self._sample_rate, self._fft_size)
+                    probe.name = dev_name
+                    probe_map[dev_idx] = probe
+
+                probes_list = [current_probe] + [probe_map[d] for d, _ in candidates]
+
+                monitor = AudioMonitor(
+                    probe_devices=probes_list,
+                    current_device=device,
+                    sample_rate=self._sample_rate,
+                    threshold=self._auto_switch_threshold,
+                    hysteresis_db=self._auto_switch_hysteresis,
+                    persistence_timeout=self._auto_switch_persistence,
+                )
+                monitor.interval = self._auto_switch_interval
+                monitor.current_index = 0
+                # Set name on the current probe
+                if current_probe:
+                    current_probe.name = probe_map[device].name
+                monitor_thread = monitor.start()
+                print(f"  Auto-switch enabled — scanning {len(probes_list)} devices "
+                      f"every {self._auto_switch_interval:.1f}s")
+
+        # Assign current probe BEFORE opening the stream so the callback
+        # sees a non-None _current_probe on its very first invocation.
+        self._current_probe = current_probe
+
+        # Open the initial audio stream (must happen before main loop)
+        stream, actual_rate = self._open_stream(device, sample_rate)
+        self._stream = stream
+        if actual_rate != sample_rate:
+            print(f"  Sample rate {sample_rate} Hz not supported — using {actual_rate} Hz")
+            self._sample_rate = actual_rate
+            all_masks = make_log_bins(
+                self._num_bars + self._bass_skip, self._freq_min, self._freq_max,
+                self._fft_size, actual_rate,
+            )
+            self._bin_masks = all_masks[self._bass_skip:]
+
+        last_frame = time.monotonic()
+
         try:
-            with sd.InputStream(
-                device=device,  # int index, name string, or None for default
-                channels=1,
-                samplerate=sample_rate,
-                blocksize=256,          # small blocks = low latency
-                dtype=np.float32,
-                callback=self._audio_callback,
-                extra_settings=extra,
-            ):
-                print(f"Streaming at {self._target_fps} fps. Ctrl-C to stop.")
-                last_frame = time.monotonic()
+            while True:
+                # Check for auto-switch signal (non-blocking)
+                # wait_for_switch returns True only when a new switch is signalled
+                # and clears the event, so repeated calls won't re-trigger.
+                if monitor is not None:
+                    if monitor.wait_for_switch(timeout=0):
+                        # A switch was signalled — clear the event so we don't
+                        # re-trigger on every loop iteration.
+                        monitor._switch_event.clear()
+                        # The monitor already updated current_index.
+                        new_device = list(probe_map.keys())[monitor.current_index]
+                        new_name = probe_map[new_device].name
+                        self._stream.stop()
+                        self._switch_device(new_device, new_name)
+                        # Sync the main-loop probe pointer and start the persistence
+                        # lock from this moment so the monitor doesn't re-probe.
+                        self._current_probe = probe_map[new_device]
+                        self._current_probe._last_active = time.monotonic()
+                        print("  Resume streaming...")
 
-                while True:
-                    # Accumulate audio into ring buffer
-                    try:
-                        chunk = self._audio_q.get(timeout=0.2)
-                    except queue.Empty:
-                        continue
+                # Accumulate audio into ring buffer
+                try:
+                    chunk = self._audio_q.get(timeout=0.2)
+                except queue.Empty:
+                    continue
 
-                    n = len(chunk)
-                    self._ring = np.roll(self._ring, -n)
-                    self._ring[-n:] = chunk
+                n = len(chunk)
+                self._ring = np.roll(self._ring, -n)
+                self._ring[-n:] = chunk
 
-                    now = time.monotonic()
-                    if now - last_frame < frame_interval:
-                        continue
-                    last_frame = now
+                now = time.monotonic()
+                if now - last_frame < frame_interval:
+                    continue
+                last_frame = now
 
-                    bars, peaks = self._process(self._ring)
+                bars, peaks = self._process(self._ring)
 
-                    # Pad to full panel height (34 frequency bands)
-                    h_full = [0] * NUM_BANDS
-                    p_full = [0] * NUM_BANDS
-                    b_full = [0] * NUM_BANDS
+                # Pad to full panel height (34 frequency bands)
+                h_full = [0] * NUM_BANDS
+                p_full = [0] * NUM_BANDS
+                b_full = [0] * NUM_BANDS
+                for i in range(self._num_bars):
+                    h_full[i] = int(bars[i])
+
+                if self._peaks_enabled:
+                    peaks_arr, peak_bright = self._peak_tracker.update(peaks)
                     for i in range(self._num_bars):
-                        h_full[i] = int(bars[i])
+                        p_full[i] = int(peaks_arr[i])
+                        b_full[i] = int(peak_bright[i])
 
-                    if self._peaks_enabled:
-                        peaks_arr, peak_bright = self._peak_tracker.update(peaks)
-                        for i in range(self._num_bars):
-                            p_full[i] = int(peaks_arr[i])
-                            b_full[i] = int(peak_bright[i])
-
-                    for panel in self._panels:
-                        panel.send_eq(h_full, p_full, b_full)
+                for panel in self._panels:
+                    panel.send_eq(h_full, p_full, b_full)
 
         except KeyboardInterrupt:
             print("\nStopping...")
@@ -463,8 +948,17 @@ class AudioVisualizer:
             for panel in self._panels:
                 panel.send_eq(zeros, zeros, zeros)
         finally:
+            if self._stream is not None:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    pass
             for panel in self._panels:
                 panel.close()
+            # Stop the monitor thread
+            if monitor is not None:
+                monitor.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +990,10 @@ def parse_args() -> argparse.Namespace:
                    help="Target frame rate (default from config)")
     p.add_argument("--no-peaks", action="store_true",
                    help="Disable peak indicators")
+    p.add_argument("--no-auto-switch", action="store_true",
+                   help="Disable auto-switching to the loudest audio source")
+    p.add_argument("--allow-mics", action="store_true",
+                   help="Include microphone devices in auto-switch candidate list")
     p.add_argument("--list-devices", action="store_true",
                    help="List audio input devices and exit")
     p.add_argument("--device", metavar="INDEX_OR_NAME",
@@ -543,6 +1041,8 @@ def main() -> None:
         cfg.setdefault("visualization", {})["peaks"] = False
     if args.device:
         cfg.setdefault("audio", {})["source"] = args.device
+    if args.allow_mics:
+        cfg.setdefault("audio", {})["allow_mics"] = True
 
     if args.clear:
         zeros = [0] * NUM_BANDS
@@ -558,7 +1058,7 @@ def main() -> None:
                 panel.close()
         return
 
-    AudioVisualizer(cfg).run()
+    AudioVisualizer(cfg, auto_switch=not args.no_auto_switch, allow_mics=args.allow_mics).run()
 
 
 if __name__ == "__main__":

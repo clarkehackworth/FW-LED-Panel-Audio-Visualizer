@@ -468,6 +468,8 @@ class AudioMonitor:
         if self._probes:
             known_indices.add(self._probes[0].device)
 
+        print(f"  [refresh] new_candidates={[n for _, n in new_candidates]}, known={known_indices}")
+
         for idx, name in new_candidates:
             if idx in known_indices:
                 probe = old_candidate_map.get(idx)

@@ -862,6 +862,9 @@ class AudioVisualizer:
         for dev in devices:
             if dev["index"] == exclude or dev["max_input_channels"] == 0:
                 continue
+            name_lower = dev["name"].lower()
+            if name_lower in ("pipewire", "default"):
+                continue
             if not self._allow_mics and _is_microphone(dev["name"]):
                 continue
             candidates.append((dev["index"], dev["name"]))

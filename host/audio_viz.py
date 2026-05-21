@@ -33,6 +33,7 @@ Protocol (custom firmware commands):
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import queue
 import sys
@@ -332,6 +333,9 @@ class AudioMonitor:
     Background monitor that listens on multiple audio devices and detects
     which one has the strongest audio signal.  Used to auto-switch the
     main visualizer stream when a louder source becomes available.
+
+    Periodically refreshes the device list to pick up new devices or
+    remove devices that disappeared.
     """
 
     def __init__(
@@ -342,12 +346,21 @@ class AudioMonitor:
         threshold: float = 1e-3,       # ~ -60 dBFS
         hysteresis_db: float = 6.0,    # dB margin before switching
         persistence_timeout: float = 60.0,  # seconds of silence before considering switch
+        refresh_interval: float = 30.0,     # seconds between device list refreshes
+        allow_mics: bool = False,           # include microphone candidates
+        probe_map: Optional[dict] = None,   # shared map updated by refresh
+        fft_size: int = 1024,              # used to create new ProbeDevice instances
     ) -> None:
         self._probes = probe_devices
         self._current = current_device
+        self._sample_rate = sample_rate
+        self._fft_size = fft_size
         self._threshold = threshold
         self._hysteresis_db = hysteresis_db
         self._persistence_timeout = persistence_timeout
+        self._refresh_interval = refresh_interval
+        self._allow_mics = allow_mics
+        self._probe_map = probe_map
         self._switch_event: Optional[threading.Event] = None
 
     # -- helpers ----------------------------------------------------------
@@ -374,11 +387,107 @@ class AudioMonitor:
                 continue  # skip the device we're already listening on
             probe.probe()
 
+    # -- device list refresh ----------------------------------------------
+
+    def _refresh_devices(self, probe_map: dict) -> bool:
+        """Re-query the system for audio devices and rebuild the probe list.
+
+        Returns True if the probe list changed (devices added or removed).
+        """
+        devices = sd.query_devices()
+
+        # Build a set of candidate device indices (excluding the current one).
+        current_idx = self._current_index
+        current_device = self._probes[current_idx].device if self._probes else None
+
+        new_candidates: list[tuple[object, str]] = []
+        for dev in devices:
+            if dev["max_input_channels"] == 0:
+                continue
+            name_lower = dev["name"].lower()
+            if name_lower in ("pipewire", "default"):
+                continue
+            if not self._allow_mics and _is_microphone(dev["name"]):
+                continue
+            new_candidates.append((dev["index"], dev["name"]))
+
+        # Separate current device from candidates.
+        new_probes: list[_ProbeDevice] = []
+        candidates_added = False
+
+        # Check if current device still exists.
+        current_still_present = False
+        for idx, name in new_candidates:
+            if idx == current_device or (current_device is not None and idx == current_device):
+                current_still_present = True
+                break
+        # Also check the current probe's device against all input devices.
+        if not current_still_present:
+            for dev in devices:
+                if dev["max_input_channels"] == 0:
+                    continue
+                if dev["index"] == current_device:
+                    current_still_present = True
+                    break
+
+        # If current device is gone, fall back to the first candidate.
+        if not current_still_present and new_candidates:
+            fallback_idx, fallback_name = new_candidates[0]
+            new_probe = _ProbeDevice(fallback_idx, self._sample_rate, self._fft_size)
+            new_probe.name = fallback_name
+            new_probes.append(new_probe)
+            new_candidates = [(idx, name) for idx, name in new_candidates if idx != fallback_idx]
+            # Rebuild probe_map with the new current device.
+            probe_map.clear()
+            probe_map[fallback_idx] = new_probe
+            self._probes = [new_probe] + [probe_map[idx] for idx, _ in new_candidates]
+            self._current_index = 0
+            # Signal the main loop to switch to the new current device.
+            if self._switch_event is not None:
+                self._switch_event.set()
+            return True  # map changed
+
+        # Start with the current probe.
+        if self._probes:
+            new_probes.append(self._probes[0])
+        else:
+            return False
+
+        # Add or update candidate probes.
+        old_candidates = self._probes[1:] if len(self._probes) > 1 else []
+        old_candidate_map = {p.device: p for p in old_candidates}
+
+        for idx, name in new_candidates:
+            if idx in old_candidate_map:
+                probe = old_candidate_map[idx]
+                probe.name = name  # update name in case it changed
+                new_probes.append(probe)
+            else:
+                # New device — create a fresh probe.
+                probe = _ProbeDevice(idx, self._sample_rate, self._fft_size)
+                probe.name = name
+                new_probes.append(probe)
+                candidates_added = True
+                probe_map[idx] = probe
+
+        # Remove probes for devices that no longer exist.
+        new_candidate_indices = {idx for idx, _ in new_candidates}
+        for probe in old_candidates:
+            if probe.device not in new_candidate_indices:
+                if probe.device in probe_map:
+                    del probe_map[probe.device]
+
+        # Update the probe list (keeping current probe at index 0).
+        self._probes = new_probes
+
+        return candidates_added or len(old_candidates) != len(new_candidates) - 1
+
     # -- the background worker thread -------------------------------------
 
     def _run(self) -> None:
         self._switch_event = threading.Event()
         self._running = True
+        self._last_refresh = time.monotonic()
 
         while self._running:
             # Wait for interval
@@ -387,10 +496,18 @@ class AudioMonitor:
             if not self._running:
                 break
 
+            # Periodically refresh the device list to pick up new/disconnected devices.
+            now = time.monotonic()
+            if (self._probe_map is not None and
+                    now - self._last_refresh >= self._refresh_interval):
+                changed = self._refresh_devices(self._probe_map)
+                if changed:
+                    print("  Device list changed, re-probing...")
+                self._last_refresh = now
+
             if self._current_index >= len(self._probes):
                 continue
 
-            now = time.monotonic()
             current_probe = self._probes[self._current_index]
 
             # --- persistence / locking ---
@@ -823,7 +940,19 @@ class AudioVisualizer:
 
         print("Connecting to panels...")
         for panel in self._panels:
-            panel.connect()
+            try:
+                panel.connect()
+            except serial.SerialException as e:
+                port_name = panel.port if hasattr(panel, "port") else "unknown"
+                print(f"ERROR: could not open panel port {port_name}: {e}")
+                # Show available serial devices
+                available = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
+                if available:
+                    print(f"Available serial devices: {', '.join(available)}")
+                else:
+                    print("No serial devices found. Check that panels are connected and recognized by the system.")
+                print("Update the port in config.yaml or pass --left / --right on the command line.")
+                sys.exit(1)
 
         device = self._find_device()
         sample_rate = self._resolve_sample_rate(device)
@@ -860,6 +989,10 @@ class AudioVisualizer:
                     threshold=self._auto_switch_threshold,
                     hysteresis_db=self._auto_switch_hysteresis,
                     persistence_timeout=self._auto_switch_persistence,
+                    refresh_interval=self._auto_switch_interval * 4,
+                    allow_mics=self._allow_mics,
+                    probe_map=probe_map,
+                    fft_size=self._fft_size,
                 )
                 monitor.interval = self._auto_switch_interval
                 monitor.current_index = 0
@@ -899,8 +1032,11 @@ class AudioVisualizer:
                         # re-trigger on every loop iteration.
                         monitor._switch_event.clear()
                         # The monitor already updated current_index.
-                        new_device = list(probe_map.keys())[monitor.current_index]
-                        new_name = probe_map[new_device].name
+                        # Look up device from the monitor's probe list (which may
+                        # have been updated by _refresh_devices).
+                        new_probe = monitor._probes[monitor.current_index]
+                        new_device = new_probe.device
+                        new_name = new_probe.name
                         self._stream.stop()
                         self._switch_device(new_device, new_name)
                         # Sync the main-loop probe pointer and start the persistence

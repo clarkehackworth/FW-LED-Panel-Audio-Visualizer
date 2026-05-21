@@ -275,10 +275,10 @@ def _reinit_portaudio() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _get_firefox_nodes() -> list[str]:
-    """Parse pw-cli output to find Firefox output nodes.
-    
-    Returns list of node names (e.g. ["Firefox"]).
+def _get_browser_nodes(browser_name: str = "Firefox") -> list[str]:
+    """Parse pw-cli output to find browser output nodes.
+
+    Returns list of node names matching *browser_name*.
     """
     try:
         import subprocess
@@ -291,26 +291,48 @@ def _get_firefox_nodes() -> list[str]:
         for line in result.stdout.splitlines():
             stripped = line.strip()
             if stripped.startswith("id "):
-                if current_node and current_node.get("node_name") == "Firefox":
-                    nodes.append(current_node["node_name"])
+                if current_node and current_node.get("app"):
+                    app = current_node.get("app", "")
+                    node = current_node.get("node_name", "")
+                    if browser_name.lower() in app.lower() and node:
+                        nodes.append(node)
                 current_node = {}
-            if "application.name" in line and "Firefox" in line:
-                current_node["app"] = True
-            if "node.name" in stripped and stripped.startswith("node.name"):
-                current_node["node_name"] = stripped.split("=")[1].strip().strip('"')
+            if "application.name" in line:
+                # Extract the application name value
+                current_node["app"] = line.split("=", 1)[1].strip().strip('"')
+            if stripped.startswith("node.name"):
+                current_node["node_name"] = stripped.split("=", 1)[1].strip().strip('"')
+        # Handle the last node (no trailing "id " line)
         if current_node and current_node.get("app"):
-            nodes.append(current_node.get("node_name", "Firefox"))
+            app = current_node.get("app", "")
+            node = current_node.get("node_name", "")
+            if browser_name.lower() in app.lower() and node:
+                nodes.append(node)
         return nodes
     except Exception as e:
-        print(f"  [pw-cli] detection failed: {e}")
+        print(f"  [pw-cli] detection of '{browser_name}' failed: {e}")
         return []
 
 
-def _ensure_firefox_monitor_sink() -> Optional[str]:
-    """Create a null-sink for Firefox monitoring if it doesn't exist.
-    
-    Returns the sink name (e.g. "firefox_monitor") or None on failure.
+def _ensure_browser_monitor_sink(
+    browser_name: str = "Firefox",
+    sink_name: str | None = None,
+    description: str | None = None,
+) -> Optional[str]:
+    """Create a null-sink for browser monitoring if it doesn't exist.
+
+    Parameters:
+        browser_name: Display name for logging (e.g. "Firefox").
+        sink_name: PulseAudio sink name (defaults to ``{browser_name}_monitor``).
+        description: Human-readable description (defaults to ``{browser_name}_Monitor``).
+
+    Returns the sink name or None on failure.
     """
+    if sink_name is None:
+        sink_name = f"{browser_name.lower().replace(' ', '_')}_monitor"
+    if description is None:
+        description = f"{browser_name}_Monitor"
+
     try:
         import subprocess
         # Check if already exists
@@ -319,73 +341,74 @@ def _ensure_firefox_monitor_sink() -> Optional[str]:
             capture_output=True, text=True, timeout=3
         )
         for line in result.stdout.splitlines():
-            if "firefox_monitor" in line:
-                print(f"  [firefox-monitor] sink already exists")
-                return "firefox_monitor"
-        
+            if sink_name in line:
+                print(f"  [{sink_name}] sink already exists")
+                return sink_name
+
         # Create null sink
         result = subprocess.run(
             ["pactl", "load-module", "module-null-sink",
-             "sink_name=firefox_monitor",
-             "sink_properties=device.description=Firefox_Monitor"],
+             f"sink_name={sink_name}",
+             f"sink_properties=device.description={description}"],
             capture_output=True, text=True, timeout=3
         )
         if result.returncode == 0:
-            print(f"  [firefox-monitor] created null sink")
-            return "firefox_monitor"
+            print(f"  [{sink_name}] created null sink")
+            return sink_name
         else:
-            print(f"  [firefox-monitor] failed: {result.stderr.strip()}")
+            print(f"  [{sink_name}] failed: {result.stderr.strip()}")
             return None
     except Exception as e:
-        print(f"  [firefox-monitor] error: {e}")
+        print(f"  [{sink_name}] error: {e}")
         return None
 
 
-def _route_firefox_to_monitor() -> bool:
-    """Route Firefox audio output to the firefox_monitor sink.
-    
-    Returns True if Firefox is found and routed, False otherwise.
+def _route_browser_to_monitor(
+    browser_name: str = "Firefox",
+    monitor_sink_name: str = "firefox_monitor",
+) -> bool:
+    """Route browser audio output to a monitor sink.
+
+    Returns True if the browser is found and routed, False otherwise.
     """
     try:
         import subprocess
-        # Find Firefox's sink-input ID
+        # Get full sink-input list once
         result = subprocess.run(
-            ["pactl", "list", "short", "sink-inputs"],
+            ["pactl", "list", "sink-inputs"],
             capture_output=True, text=True, timeout=3
         )
+        # Parse blocks by Sink Input #N
+        blocks: list[tuple[int, str]] = []
+        current_id: int | None = None
+        current_block: list[str] = []
         for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) >= 1:
-                sink_input_id = parts[0]
-                # Check if this is Firefox
-                result2 = subprocess.run(
-                    ["pactl", "list", "sink-inputs"],
+            if line.strip().startswith("Sink Input #"):
+                if current_id is not None:
+                    blocks.append((current_id, "\n".join(current_block)))
+                current_id = int(line.split("#")[-1].strip())
+                current_block = [line]
+            elif current_id is not None:
+                current_block.append(line)
+        if current_id is not None:
+            blocks.append((current_id, "\n".join(current_block)))
+
+        # Find and route the browser's sink-input
+        for sink_input_id, block in blocks:
+            if browser_name.lower() in block.lower():
+                route_result = subprocess.run(
+                    ["pactl", "move-sink-input", str(sink_input_id), monitor_sink_name],
                     capture_output=True, text=True, timeout=3
                 )
-                # Parse for this sink-input ID
-                in_firefox_block = False
-                for l2 in result2.stdout.splitlines():
-                    if f"Sink Input #{sink_input_id}" in l2:
-                        in_firefox_block = True
-                    elif l2.strip().startswith("Sink:") and in_firefox_block:
-                        # Get current sink
-                        current_sink = l2.split()[-1] if len(l2.split()) > 1 else ""
-                    elif in_firefox_block and "Application Name" in l2:
-                        if "Firefox" in l2:
-                            # Route to firefox_monitor
-                            route_result = subprocess.run(
-                                ["pactl", "move-sink-input", sink_input_id, "firefox_monitor"],
-                                capture_output=True, text=True, timeout=3
-                            )
-                            if route_result.returncode == 0:
-                                print(f"  [firefox-monitor] routed Firefox to monitor sink")
-                                return True
-                            else:
-                                print(f"  [firefox-monitor] route failed: {route_result.stderr.strip()}")
-                                return False
+                if route_result.returncode == 0:
+                    print(f"  [{monitor_sink_name}] routed {browser_name} to monitor sink")
+                    return True
+                else:
+                    print(f"  [{monitor_sink_name}] route failed: {route_result.stderr.strip()}")
+                    return False
         return False
     except Exception as e:
-        print(f"  [firefox-monitor] error: {e}")
+        print(f"  [{monitor_sink_name}] error: {e}")
         return False
 
 
@@ -562,7 +585,6 @@ class AudioMonitor:
         """
         # 1. Query PortAudio devices
         devices = sd.query_devices()
-        pa_device_names = {d['name'] for d in devices if d['max_input_channels'] > 0}
 
         # 2. Build candidates from PortAudio
         pa_new_candidates: list[tuple[object, str]] = []
@@ -577,27 +599,31 @@ class AudioMonitor:
             pa_new_candidates.append((dev["index"], dev["name"]))
                
 
-        # 3. Check for Firefox playback and route to monitor
-        firefox_nodes = _get_firefox_nodes()
-        if firefox_nodes:
-            # Firefox is playing — ensure the monitor sink exists and is routed
-            sink_name = _ensure_firefox_monitor_sink()
-            if sink_name:
-                _route_firefox_to_monitor()
-                # Add firefox_monitor as a candidate (capture device)
-                # It will appear in sd.query_devices() after the null sink is created
-                for dev in devices:
-                    if "firefox_monitor" in dev["name"].lower():
-                        pa_new_candidates.append((dev["index"], dev["name"]))
-                        print(f"  [firefox-monitor] using capture device: {dev['name']} (idx={dev['index']})")
-                        break
-                else:
-                    # Not yet in PortAudio list — try by name
-                    try:
-                        print(f"  [firefox-monitor] adding candidate by name: {sink_name}")
-                        pa_new_candidates.append((sink_name, sink_name))
-                    except Exception:
-                        pass
+        # 3. Check for browser playback and route to monitor
+        #    Try common browsers; use the first one that is playing.
+        _browser_order = ("Firefox", "Chrome", "Chromium")
+        for browser in _browser_order:
+            browser_nodes = _get_browser_nodes(browser)
+            if browser_nodes:
+                browser_sink_name = f"{browser.lower().replace(' ', '_')}_monitor"
+                monitor_sink = _ensure_browser_monitor_sink(
+                    browser_name=browser,
+                    sink_name=browser_sink_name,
+                )
+                if monitor_sink:
+                    _route_browser_to_monitor(browser_name=browser, monitor_sink_name=monitor_sink)
+                    # Add the monitor sink as a candidate (capture device)
+                    # It will appear in sd.query_devices() after the null sink is created
+                    for dev in devices:
+                        if browser_sink_name in dev["name"].lower():
+                            pa_new_candidates.append((dev["index"], dev["name"]))
+                            print(f"  [{browser_sink_name}] using capture device: {dev['name']} (idx={dev['index']})")
+                            break
+                    else:
+                        # Not yet in PortAudio list — add by name
+                        print(f"  [{browser_sink_name}] adding candidate by name: {browser_sink_name}")
+                        pa_new_candidates.append((browser_sink_name, browser_sink_name))
+                break  # Found and handled one browser; move on
 
         # Build a set of candidate device indices (excluding the current one).
         current_idx = self._current_index
@@ -1025,7 +1051,6 @@ class AudioVisualizer:
             "easyeffects sink",
             "equalizer",
             "output level meter",
-            "firefox_monitor",
             "firefox",
             "chromium",
         ]
@@ -1431,9 +1456,6 @@ def main() -> None:
         cfg.setdefault("audio", {})["source"] = args.device
     if args.allow_mics:
         cfg.setdefault("audio", {})["allow_mics"] = True
-
-    # Create Firefox monitor sink at startup (if Firefox is playing)
-    _ensure_firefox_monitor_sink()
 
     if args.clear:
         zeros = [0] * NUM_BANDS

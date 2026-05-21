@@ -244,11 +244,13 @@ class _ProbeDevice:
     def probe(self) -> float:
         """Open a short-lived stream, read energy, return RMS level.
 
-        Runs in a background thread with a 3-second timeout to prevent
-        hanging on devices that can't be opened.
+        Runs in a background thread with a 5-second join timeout so we
+        don't hang on devices that can't be opened.  Blocks until the
+        probe finishes or times out.
         """
         buf = []
-        result = {"energy": 0.0, "done": False}
+        done = threading.Event()
+        result = {"energy": 0.0}
 
         def _cb(indata, frames, time_info, status):
             buf.append(indata[:, 0].copy())
@@ -276,7 +278,7 @@ class _ProbeDevice:
                             stream.start()
                             break
                         except Exception:
-                            stream = None
+                            stream = None  # type: ignore[assignment]
                     else:
                         return
 
@@ -298,10 +300,12 @@ class _ProbeDevice:
                         result["energy"] = energy
             except Exception:
                 pass
+            finally:
+                done.set()
 
         t = threading.Thread(target=_do_probe, daemon=True)
         t.start()
-        t.join(timeout=3.0)
+        t.join(timeout=5.0)  # wait up to ~5.5 s total
         return result["energy"]
 
     @property
@@ -553,9 +557,10 @@ class AudioMonitor:
                 switch = False
                 if device_changed and new_devices:
                     # Device list changed + new devices found — switch to the
-                    # first new device.
+                    # first new device that is actually different from the
+                    # current one (skip if same device just got a new index).
                     for probe in self._probes:
-                        if probe.device in new_devices:
+                        if probe.device in new_devices and probe.name != current_probe.name:
                             current_name = current_probe.name
                             new_name = probe.name
                             print(f"  Auto-switch (new device): {current_name} -> {new_name}")

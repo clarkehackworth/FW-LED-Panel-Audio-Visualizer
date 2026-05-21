@@ -429,6 +429,7 @@ class AudioMonitor:
                 if dev["index"] == current_device:
                     current_still_present = True
                     break
+ 
 
         # If current device is gone, fall back to the first candidate.
         if not current_still_present and new_candidates:
@@ -462,10 +463,17 @@ class AudioMonitor:
         # Add or update candidate probes.
         old_candidates = self._probes[1:] if len(self._probes) > 1 else []
         old_candidate_map = {p.device: p for p in old_candidates}
+        # Also exclude the current device so it's not counted as "new"
+        known_indices = set(old_candidate_map.keys())
+        if self._probes:
+            known_indices.add(self._probes[0].device)
 
         for idx, name in new_candidates:
-            if idx in old_candidate_map:
-                probe = old_candidate_map[idx]
+            if idx in known_indices:
+                probe = old_candidate_map.get(idx)
+                if probe is None:
+                    # It's the current probe — reuse it at index 0 already
+                    continue
                 probe.name = name  # update name in case it changed
                 new_probes.append(probe)
             else:
@@ -487,7 +495,13 @@ class AudioMonitor:
         # Update the probe list (keeping current probe at index 0).
         self._probes = new_probes
 
-        return candidates_added or len(old_candidates) != len(new_candidates) - 1, new_device_indices
+        # Only signal device change when genuinely new devices are added
+        # or existing devices are removed. Name-only updates don't count.
+        devices_removed = any(
+            p.device not in {idx for idx, _ in new_candidates}
+            for p in old_candidates
+        )
+        return candidates_added or devices_removed, new_device_indices
 
     # -- the background worker thread -------------------------------------
 
@@ -556,11 +570,12 @@ class AudioMonitor:
 
                 switch = False
                 if device_changed and new_devices:
-                    # Device list changed + new devices found — switch to the
-                    # first new device that is actually different from the
-                    # current one (skip if same device just got a new index).
+                    # Device list changed + new devices found — switch to
+                    # the first new device.  We already have hysteresis
+                    # gating for energy-based switching; for new device
+                    # discovery, just switch and let energy probe decide.
                     for probe in self._probes:
-                        if probe.device in new_devices and probe.name != current_probe.name:
+                        if probe.device in new_devices:
                             current_name = current_probe.name
                             new_name = probe.name
                             print(f"  Auto-switch (new device): {current_name} -> {new_name}")

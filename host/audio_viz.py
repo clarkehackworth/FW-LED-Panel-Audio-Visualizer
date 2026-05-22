@@ -637,95 +637,100 @@ class AudioMonitor:
 
             current_db = self._rms_to_db(current_probe.energy)
 
-            # Always probe candidates every cycle so we can detect when the
-            # current device is worse than a candidate.  Hysteresis gating
-            # on the switch decision prevents flip-flopping.
-            if device_changed and new_devices:
-                print(f"  Device list changed (new={new_devices}), probing candidates...")
-            else:
-                print(f"  Scanning for better audio device...")
+            # When the current device is locked in (active within the persistence
+            # window), back off probe frequency to persistence_timeout — there's
+            # no point sampling other devices every 5 s when we won't switch anyway.
+            probe_interval = self._interval if can_switch else self._persistence_timeout
+            should_probe = device_changed or (now - self._last_probe >= probe_interval)
 
-            self._probe_all()
+            if should_probe:
+                self._last_probe = now
+                if device_changed and new_devices:
+                    print(f"  Device list changed (new={new_devices}), probing candidates...")
+                else:
+                    print(f"  Scanning for better audio device...")
 
-            best_idx = self._current_index
-            best_db = current_db
+                self._probe_all()
 
-            # Re-read current energy AFTER probing to get the live value.
-            # The main callback may have updated it since we computed
-            # current_db above.  Also, the probe's own _last_active
-            # was set during probing if it saw energy > threshold.
-            current_db = self._rms_to_db(current_probe.energy)
+                best_idx = self._current_index
+                best_db = current_db
 
-            for i, probe in enumerate(self._probes):
-                if i == self._current_index:
-                    continue
-                p_db = self._rms_to_db(probe.energy)
-                print(f", {probe.name[:20]}={p_db:.1f} dB", end="")
-                if p_db > best_db and p_db > self._rms_to_db(self._threshold):
-                    best_idx = i
-                    best_db = p_db
-            print()
+                # Re-read current energy AFTER probing to get the live value.
+                # The main callback may have updated it since we computed
+                # current_db above.  Also, the probe's own _last_active
+                # was set during probing if it saw energy > threshold.
+                current_db = self._rms_to_db(current_probe.energy)
 
-            switch = False
-            if device_changed and new_devices:
-                # Device list changed + new devices found.
-                # Only switch to the new device if it's a known-good monitor source
-                # (priority name match) OR if it already has audio signal.
-                # Avoid switching to raw ALSA hw devices with no signal — those
-                # are typically mic inputs that will never carry system audio.
-                _priority_pats = [
-                    "monitor", "firefox", "chromium",
-                    "easy effects", "easyeffects", "equalizer", "output level",
-                ]
-                best_new_probe = None
-                for probe in self._probes:
-                    if probe.device not in new_devices:
+                for i, probe in enumerate(self._probes):
+                    if i == self._current_index:
                         continue
-                    name_lower = probe.name.lower()
                     p_db = self._rms_to_db(probe.energy)
-                    is_priority = any(p in name_lower for p in _priority_pats)
-                    has_signal = p_db > self._rms_to_db(self._threshold)
-                    if is_priority or has_signal:
-                        best_new_probe = probe
-                        break
+                    print(f", {probe.name[:20]}={p_db:.1f} dB", end="")
+                    if p_db > best_db and p_db > self._rms_to_db(self._threshold):
+                        best_idx = i
+                        best_db = p_db
+                print()
 
-                if best_new_probe is not None:
-                    current_name = current_probe.name
-                    new_name = best_new_probe.name
-                    print(f"  Auto-switch (new device): {current_name} -> {new_name}")
-                    self._current_index = self._probes.index(best_new_probe)
-                    self._switch_event.set()
-                    switch = True
-                else:
-                    print(f"  (new device(s) found but none are priority sources or have signal — keeping current)")
-            elif best_idx != self._current_index:
-                margin_db = best_db - current_db
-                # Bypass hysteresis when the current device is effectively
-                # silent — there's nothing to "hold" onto so we should
-                # immediately switch to the first loud candidate.
-                current_silent = current_db < self._rms_to_db(self._threshold)
-                if margin_db >= self._hysteresis_db or (current_silent and best_db > self._rms_to_db(self._threshold)):
-                    current_name = current_probe.name
-                    new_name = self._probes[best_idx].name
-                    print(f"  Auto-switch: {current_name} -> {new_name} "
-                          f"({current_db:.1f} dB -> {best_db:.1f} dB)")
-                    self._current_index = best_idx
-                    self._switch_event.set()
-                    switch = True
-                else:
-                    print(f"    (no candidate loud enough by {self._hysteresis_db:.0f} dB; "
-                          f"margin={margin_db:.1f} dB, best_idx={best_idx})")
+                switch = False
+                if device_changed and new_devices:
+                    # Device list changed + new devices found.
+                    # Only switch to the new device if it's a known-good monitor source
+                    # (priority name match) OR if it already has audio signal.
+                    # Avoid switching to raw ALSA hw devices with no signal — those
+                    # are typically mic inputs that will never carry system audio.
+                    _priority_pats = [
+                        "monitor", "firefox", "chromium",
+                        "easy effects", "easyeffects", "equalizer", "output level",
+                    ]
+                    best_new_probe = None
+                    for probe in self._probes:
+                        if probe.device not in new_devices:
+                            continue
+                        name_lower = probe.name.lower()
+                        p_db = self._rms_to_db(probe.energy)
+                        is_priority = any(p in name_lower for p in _priority_pats)
+                        has_signal = p_db > self._rms_to_db(self._threshold)
+                        if is_priority or has_signal:
+                            best_new_probe = probe
+                            break
 
-            # If ALL candidates are silent, speed up device-list refresh so a new
-            # PipeWire monitor source (e.g. Firefox starting to play) is detected
-            # within one probe cycle instead of waiting up to refresh_interval seconds.
-            all_silent = (current_db < self._rms_to_db(self._threshold) and
-                          best_db < self._rms_to_db(self._threshold))
-            if all_silent:
-                self._refresh_interval = self._interval  # refresh every probe cycle
-            else:
-                # Back off to the normal refresh cadence once we have signal.
-                self._refresh_interval = self._interval * 4
+                    if best_new_probe is not None:
+                        current_name = current_probe.name
+                        new_name = best_new_probe.name
+                        print(f"  Auto-switch (new device): {current_name} -> {new_name}")
+                        self._current_index = self._probes.index(best_new_probe)
+                        self._switch_event.set()
+                        switch = True
+                    else:
+                        print(f"  (new device(s) found but none are priority sources or have signal — keeping current)")
+                elif best_idx != self._current_index:
+                    margin_db = best_db - current_db
+                    # Bypass hysteresis when the current device is effectively
+                    # silent — there's nothing to "hold" onto so we should
+                    # immediately switch to the first loud candidate.
+                    current_silent = current_db < self._rms_to_db(self._threshold)
+                    if margin_db >= self._hysteresis_db or (current_silent and best_db > self._rms_to_db(self._threshold)):
+                        current_name = current_probe.name
+                        new_name = self._probes[best_idx].name
+                        print(f"  Auto-switch: {current_name} -> {new_name} "
+                              f"({current_db:.1f} dB -> {best_db:.1f} dB)")
+                        self._current_index = best_idx
+                        self._switch_event.set()
+                        switch = True
+                    else:
+                        print(f"    (no candidate loud enough by {self._hysteresis_db:.0f} dB; "
+                              f"margin={margin_db:.1f} dB, best_idx={best_idx})")
+
+                # If ALL candidates are silent, speed up device-list refresh so a new
+                # PipeWire monitor source (e.g. Firefox starting to play) is detected
+                # within one probe cycle instead of waiting up to refresh_interval seconds.
+                all_silent = (current_db < self._rms_to_db(self._threshold) and
+                              best_db < self._rms_to_db(self._threshold))
+                if all_silent:
+                    self._refresh_interval = self._interval  # refresh every probe cycle
+                else:
+                    # Back off to the normal refresh cadence once we have signal.
+                    self._refresh_interval = self._interval * 4
 
     # -- public API -------------------------------------------------------
 
@@ -748,6 +753,7 @@ class AudioMonitor:
     def start(self) -> threading.Thread:
         self._interval = 5.0  # default interval in seconds
         self._current_index = 0
+        self._last_probe = 0.0
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="audio-monitor")
         self._thread.start()
@@ -873,6 +879,18 @@ class AudioVisualizer:
         self._bin_assign_valid  = valid
         self._bin_assign_counts = counts
 
+        # At low frequencies, log bands are narrower than one FFT bin, so multiple
+        # bands snap to the same bin and only the last one wins in the assignment
+        # above.  The earlier bands end up with count=0 and would show db_floor.
+        # Fix: for each zero-count band, copy the value from the nearest live neighbor.
+        zero_bands = np.where(counts == 0)[0]
+        nz_bands   = np.where(counts > 0)[0]
+        self._zero_band_sources: dict[int, int] = {}
+        if len(zero_bands) and len(nz_bands):
+            for z in zero_bands:
+                nearest = nz_bands[int(np.argmin(np.abs(nz_bands - z)))]
+                self._zero_band_sources[int(z)] = int(nearest)
+
     # ------------------------------------------------------------------
     # Audio callback — runs in a separate C thread; keep it minimal
     # ------------------------------------------------------------------
@@ -918,6 +936,8 @@ class AudioVisualizer:
         raw     = np.where(self._bin_assign_counts > 0,
                            sums / self._bin_assign_counts,
                            self._db_floor)
+        for z, src in self._zero_band_sources.items():
+            raw[z] = raw[src]
 
         # Map dB range to [0, 1]
         normalized = np.clip((raw - self._db_floor) / (self._db_ceil - self._db_floor), 0.0, 1.0)

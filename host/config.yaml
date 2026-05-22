@@ -91,10 +91,10 @@ visualization:
   target_fps: 30         # frames per second sent to panels
 
   # Bar brightness gradient: base is always 255; tip fades to this value (0-255).
-  bar_fade_min: 40
+  bar_fade_min: 0
 
   # Peak indicators — a bright pixel that stays at the widest recent bar position.
   peaks: true
-  peak_hold_frames: 15   # frames to hold at the peak before starting to fall
+  peak_hold_frames: 5   # frames to hold at the peak before starting to fall
   peak_fall_speed: 1.0   # columns per frame the peak dot retreats after hold expires
-  peak_fade_speed: 13.0   # brightness units per frame the peak dot fades (0-255 scale; 0 = no fade)
+  peak_fade_speed: 10.0   # brightness units per frame the peak dot fades (0-255 scale; 0 = no fade)

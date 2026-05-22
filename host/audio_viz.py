@@ -34,8 +34,6 @@ from __future__ import annotations
 
 import argparse
 
-import ctypes
-
 import glob
 
 import os
@@ -115,9 +113,25 @@ class Panel:
         self._lock = threading.Lock()
 
     def connect(self) -> None:
-        self._ser = serial.Serial(self.port, 115200, timeout=0.1, write_timeout=0.05)
+        self._ser = serial.Serial(self.port, 115200, timeout=0.1, write_timeout=2.0)
+        # Flush any stale data from the device
+        self._ser.reset_input_buffer()
+        self._ser.reset_output_buffer()
         cfg_cmd = MAGIC + bytes([CMD_SET_EQ_CONFIG, self._flags, self._fade_min])
-        self._ser.write(cfg_cmd)
+        # Retry config handshake up to 3 times
+        for attempt in range(3):
+            try:
+                self._ser.write(cfg_cmd)
+                # Small delay to let device process the config
+                self._ser.in_waiting  # force read-check
+                break
+            except serial.SerialException as exc:
+                if attempt < 2:
+                    print(f"  Warning: config write to {self.port} attempt {attempt+1} failed: {exc} — retrying…")
+                    self._ser.reset_input_buffer()
+                    self._ser.reset_output_buffer()
+                else:
+                    print(f"  Warning: config write to {self.port} failed after 3 attempts: {exc}")
         ext = "right-to-left" if self._flags & 0x01 else "left-to-right"
         freq = "bottom" if self._flags & 0x02 else "top"
         print(f"  Panel {self.port}: connected (bars {ext}, low-freq at {freq})")
@@ -144,11 +158,18 @@ class Panel:
         b += [0] * (NUM_BANDS - len(b))
         cmd = MAGIC + bytes([CMD_DISPLAY_EQ]) + self._pack_nibbles(h) + self._pack_nibbles(p) + self._pack_nibbles(b)
         with self._lock:
-            try:
-                if self._ser and self._ser.is_open:
-                    self._ser.write(cmd)
-            except serial.SerialException as exc:
-                print(f"  Warning: serial write to {self.port} failed: {exc}")
+            if self._ser and self._ser.is_open:
+                # Retry up to 3 times on timeout; skip warnings after first failure to avoid spam
+                for attempt in range(3):
+                    try:
+                        self._ser.write(cmd)
+                        break
+                    except serial.SerialException as exc:
+                        if attempt < 2:
+                            print(f"  Warning: serial write to {self.port} attempt {attempt+1} failed: {exc} — retrying…")
+                            time.sleep(0.05)  # brief pause before retry
+                        else:
+                            print(f"  Warning: serial write to {self.port} failed after 3 attempts: {exc}")
 
     def close(self) -> None:
         if self._ser and self._ser.is_open:
@@ -240,178 +261,6 @@ def _is_microphone(name: str) -> bool:
 # PortAudio re-init helper (forces device list refresh)
 # ---------------------------------------------------------------------------
 
-# Global lock to serialize PortAudio re-init with probe operations
-_pa_init_lock = threading.Lock()
-
-
-def _reinit_portaudio() -> bool:
-    """Re-initialize PortAudio to pick up new PipeWire devices.
-    
-    PortAudio caches the device list at init time. When new PipeWire nodes
-    appear (e.g., Firefox starts playing audio), we need to re-init to
-    see them. This is safe because probe() operations are synchronous
-    (open → measure → close) and never hold streams open.
-    
-    Returns True if re-init succeeded, False otherwise.
-    """
-    try:
-        lib = ctypes.CDLL("libportaudio.so")
-        ret = lib.Pa_Terminate()
-        if ret != 0:
-            print(f"  [portaudio] Pa_Terminate failed: {ret}")
-            return False
-        # Give PipeWire a moment to clean up the terminated context
-        time.sleep(0.1)
-        sd._initialized = False
-        sd._initialize()
-        return True
-    except Exception as e:
-        print(f"  [portaudio] re-init failed: {e}")
-        return False
-
-
-# ---------------------------------------------------------------------------
-# PipeWire device detection (bypasses PortAudio caching)
-# ---------------------------------------------------------------------------
-
-
-def _get_browser_nodes(browser_name: str = "Firefox") -> list[str]:
-    """Parse pw-cli output to find browser output nodes.
-
-    Returns list of node names matching *browser_name*.
-    """
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["pw-cli", "list-objects", "Node"],
-            capture_output=True, text=True, timeout=2
-        )
-        nodes: list[str] = []
-        current_node: dict = {}
-        for line in result.stdout.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("id "):
-                if current_node and current_node.get("app"):
-                    app = current_node.get("app", "")
-                    node = current_node.get("node_name", "")
-                    if browser_name.lower() in app.lower() and node:
-                        nodes.append(node)
-                current_node = {}
-            if "application.name" in line:
-                # Extract the application name value
-                current_node["app"] = line.split("=", 1)[1].strip().strip('"')
-            if stripped.startswith("node.name"):
-                current_node["node_name"] = stripped.split("=", 1)[1].strip().strip('"')
-        # Handle the last node (no trailing "id " line)
-        if current_node and current_node.get("app"):
-            app = current_node.get("app", "")
-            node = current_node.get("node_name", "")
-            if browser_name.lower() in app.lower() and node:
-                nodes.append(node)
-        return nodes
-    except Exception as e:
-        print(f"  [pw-cli] detection of '{browser_name}' failed: {e}")
-        return []
-
-
-def _ensure_browser_monitor_sink(
-    browser_name: str = "Firefox",
-    sink_name: str | None = None,
-    description: str | None = None,
-) -> Optional[str]:
-    """Create a null-sink for browser monitoring if it doesn't exist.
-
-    Parameters:
-        browser_name: Display name for logging (e.g. "Firefox").
-        sink_name: PulseAudio sink name (defaults to ``{browser_name}_monitor``).
-        description: Human-readable description (defaults to ``{browser_name}_Monitor``).
-
-    Returns the sink name or None on failure.
-    """
-    if sink_name is None:
-        sink_name = f"{browser_name.lower().replace(' ', '_')}_monitor"
-    if description is None:
-        description = f"{browser_name}_Monitor"
-
-    try:
-        import subprocess
-        # Check if already exists
-        result = subprocess.run(
-            ["pactl", "list", "short", "sinks"],
-            capture_output=True, text=True, timeout=3
-        )
-        for line in result.stdout.splitlines():
-            if sink_name in line:
-                print(f"  [{sink_name}] sink already exists")
-                return sink_name
-
-        # Create null sink
-        result = subprocess.run(
-            ["pactl", "load-module", "module-null-sink",
-             f"sink_name={sink_name}",
-             f"sink_properties=device.description={description}"],
-            capture_output=True, text=True, timeout=3
-        )
-        if result.returncode == 0:
-            print(f"  [{sink_name}] created null sink")
-            return sink_name
-        else:
-            print(f"  [{sink_name}] failed: {result.stderr.strip()}")
-            return None
-    except Exception as e:
-        print(f"  [{sink_name}] error: {e}")
-        return None
-
-
-def _route_browser_to_monitor(
-    browser_name: str = "Firefox",
-    monitor_sink_name: str = "firefox_monitor",
-) -> bool:
-    """Route browser audio output to a monitor sink.
-
-    Returns True if the browser is found and routed, False otherwise.
-    """
-    try:
-        import subprocess
-        # Get full sink-input list once
-        result = subprocess.run(
-            ["pactl", "list", "sink-inputs"],
-            capture_output=True, text=True, timeout=3
-        )
-        # Parse blocks by Sink Input #N
-        blocks: list[tuple[int, str]] = []
-        current_id: int | None = None
-        current_block: list[str] = []
-        for line in result.stdout.splitlines():
-            if line.strip().startswith("Sink Input #"):
-                if current_id is not None:
-                    blocks.append((current_id, "\n".join(current_block)))
-                current_id = int(line.split("#")[-1].strip())
-                current_block = [line]
-            elif current_id is not None:
-                current_block.append(line)
-        if current_id is not None:
-            blocks.append((current_id, "\n".join(current_block)))
-
-        # Find and route the browser's sink-input
-        for sink_input_id, block in blocks:
-            if browser_name.lower() in block.lower():
-                route_result = subprocess.run(
-                    ["pactl", "move-sink-input", str(sink_input_id), monitor_sink_name],
-                    capture_output=True, text=True, timeout=3
-                )
-                if route_result.returncode == 0:
-                    print(f"  [{monitor_sink_name}] routed {browser_name} to monitor sink")
-                    return True
-                else:
-                    print(f"  [{monitor_sink_name}] route failed: {route_result.stderr.strip()}")
-                    return False
-        return False
-    except Exception as e:
-        print(f"  [{monitor_sink_name}] error: {e}")
-        return False
-
-
 # ---------------------------------------------------------------------------
 # Audio device monitor (background auto-switching)
 # ---------------------------------------------------------------------------
@@ -443,33 +292,63 @@ class _ProbeDevice:
         result = {"energy": 0.0}
 
         def _cb(indata, frames, time_info, status):
+            if status:
+                print(f"  [probe] status for {self.device}: {status}")
+            if indata.ndim < 2 or indata.shape[1] < 1:
+                return
             buf.append(indata[:, 0].copy())
+
+        def _resolve_device():
+            """Resolve a device identifier (index or name) to what sounddevice accepts."""
+            dev = self.device
+            if isinstance(dev, int):
+                return dev
+            # String name — verify it matches a real PortAudio input device.
+            for d in sd.query_devices():
+                if d["max_input_channels"] == 0:
+                    continue
+                if dev in d["name"].lower():
+                    return d["index"]
+            print(f"  [probe] device name '{dev}' not found in PortAudio devices")
+            return None
 
         def _do_probe():
             stream = None
+            opened = False
             try:
+                dev = _resolve_device()
+                if dev is None:
+                    return
+
                 with _suppress_stderr():
-                    for rate in (self._sample_rate, 48000, 44100, 48001, 44101):
-                        if stream is not None:
+                    # Try stereo first (for PipeWire monitor sources),
+                    # then mono (for regular hardware inputs).
+                    for channels in (2, 1):
+                        for rate in (self._sample_rate, 48000, 44100, 48001, 44101):
+                            if stream is not None:
+                                try:
+                                    stream.stop()
+                                    stream.close()
+                                except Exception:
+                                    pass
                             try:
-                                stream.stop()
-                                stream.close()
+                                stream = sd.InputStream(
+                                    device=dev,
+                                    channels=channels,
+                                    samplerate=rate,
+                                    blocksize=256,
+                                    dtype=np.float32,
+                                    callback=_cb,
+                                )
+                                stream.start()
+                                opened = True
+                                break
                             except Exception:
-                                pass
-                        try:
-                            stream = sd.InputStream(
-                                device=self.device,
-                                channels=1,
-                                samplerate=rate,
-                                blocksize=256,
-                                dtype=np.float32,
-                                callback=_cb,
-                            )
-                            stream.start()
+                                stream = None  # type: ignore[assignment]
+                        if opened:
                             break
-                        except Exception:
-                            stream = None  # type: ignore[assignment]
                     else:
+                        print(f"  [probe] failed to open device {self.name} (stereo+mono)")
                         return
 
                     time.sleep(0.5)
@@ -488,8 +367,10 @@ class _ProbeDevice:
                             if energy > 1e-6:
                                 self._last_active = now
                         result["energy"] = energy
-            except Exception:
-                pass
+                        db = 20.0 * np.log10(energy) if energy > 1e-10 else -100.0
+                        print(f"  [probe] {self.name}: {energy:.6f} RMS ({db:.1f} dB)")
+            except Exception as e:
+                print(f"  [probe] error on {self.name}: {e}")
             finally:
                 done.set()
 
@@ -597,40 +478,12 @@ class AudioMonitor:
             if not self._allow_mics and _is_microphone(dev["name"]):
                 continue
             pa_new_candidates.append((dev["index"], dev["name"]))
-               
-
-        # 3. Check for browser playback and route to monitor
-        #    Try common browsers; use the first one that is playing.
-        _browser_order = ("Firefox", "Chrome", "Chromium")
-        for browser in _browser_order:
-            browser_nodes = _get_browser_nodes(browser)
-            if browser_nodes:
-                browser_sink_name = f"{browser.lower().replace(' ', '_')}_monitor"
-                monitor_sink = _ensure_browser_monitor_sink(
-                    browser_name=browser,
-                    sink_name=browser_sink_name,
-                )
-                if monitor_sink:
-                    _route_browser_to_monitor(browser_name=browser, monitor_sink_name=monitor_sink)
-                    # Add the monitor sink as a candidate (capture device)
-                    # It will appear in sd.query_devices() after the null sink is created
-                    for dev in devices:
-                        if browser_sink_name in dev["name"].lower():
-                            pa_new_candidates.append((dev["index"], dev["name"]))
-                            print(f"  [{browser_sink_name}] using capture device: {dev['name']} (idx={dev['index']})")
-                            break
-                    else:
-                        # Not yet in PortAudio list — add by name
-                        print(f"  [{browser_sink_name}] adding candidate by name: {browser_sink_name}")
-                        pa_new_candidates.append((browser_sink_name, browser_sink_name))
-                break  # Found and handled one browser; move on
 
         # Build a set of candidate device indices (excluding the current one).
         current_idx = self._current_index
         current_device = self._probes[current_idx].device if self._probes else None
 
-        # Use the combined candidate list (PortAudio + pw-cli Firefox)
-        # Deduplicate (firefox_monitor may be added twice)
+        # Deduplicate candidates
         seen_indices: set = set()
         new_candidates = []
         for idx, name in pa_new_candidates:
@@ -644,20 +497,33 @@ class AudioMonitor:
         candidates_added = False
         new_device_indices: set = set()
 
-        # Check if current device still exists.
-        current_still_present = False
-        for idx, name in new_candidates:
-            if idx == current_device or (current_device is not None and idx == current_device):
-                current_still_present = True
-                break
-        # Also check the current probe's device against all input devices.
-        if not current_still_present:
-            for dev in devices:
-                if dev["max_input_channels"] == 0:
-                    continue
-                if dev["index"] == current_device:
+        # Check if current device still exists in the candidate list.
+        # None means "sounddevice default input" — it always exists.
+        if current_device is None:
+            current_still_present = True
+        else:
+            current_still_present = False
+            for idx, name in new_candidates:
+                if idx == current_device:
                     current_still_present = True
                     break
+            # Also check against all PortAudio input devices (handles string names
+            # and index mismatches after a PortAudio re-init).
+            if not current_still_present:
+                if isinstance(current_device, str):
+                    for dev in devices:
+                        if dev["max_input_channels"] == 0:
+                            continue
+                        if current_device in dev["name"].lower():
+                            current_still_present = True
+                            break
+                else:
+                    for dev in devices:
+                        if dev["max_input_channels"] == 0:
+                            continue
+                        if dev["index"] == current_device:
+                            current_still_present = True
+                            break
  
 
         # If current device is gone, fall back to the first candidate.
@@ -757,7 +623,7 @@ class AudioMonitor:
                     now - self._last_refresh >= self._refresh_interval):
                 device_changed, new_devices = self._refresh_devices(self._probe_map)
                 if device_changed:
-                    print(f"  Device list changed, probing candidates... (changed={device_changed}, new={new_devices})")
+                    print(f"  [refresh] Device list changed (changed={device_changed}, new={new_devices})")
                 self._last_refresh = now
 
             if self._current_index >= len(self._probes):
@@ -776,60 +642,95 @@ class AudioMonitor:
 
             current_db = self._rms_to_db(current_probe.energy)
 
-            # Probe when device list changed or current device has been silent.
-            if device_changed or can_switch:
-                if device_changed:
-                    print(f"  Device list changed, probing candidates...")
-                else:
-                    print(f"  {current_probe.name} silent, probing candidates...")
-
-                self._probe_all()
-
-                best_idx = self._current_index
-                best_db = current_db
-
-                for i, probe in enumerate(self._probes):
-                    if i == self._current_index:
-                        continue
-                    p_db = self._rms_to_db(probe.energy)
-                    print(f", {probe.name[:20]}={p_db:.1f} dB", end="")
-                    if p_db > best_db and p_db > self._rms_to_db(self._threshold):
-                        best_idx = i
-                        best_db = p_db
-                print()
-
-                switch = False
-                if device_changed and new_devices:
-                    # Device list changed + new devices found — switch to
-                    # the first new device.  We already have hysteresis
-                    # gating for energy-based switching; for new device
-                    # discovery, just switch and let energy probe decide.
-                    for probe in self._probes:
-                        if probe.device in new_devices:
-                            current_name = current_probe.name
-                            new_name = probe.name
-                            print(f"  Auto-switch (new device): {current_name} -> {new_name}")
-                            self._current_index = self._probes.index(probe)
-                            self._switch_event.set()
-                            switch = True
-                            break
-                    if not switch:
-                        print(f"    (no new device indices found — keeping current)")
-                elif best_idx != self._current_index:
-                    margin_db = best_db - current_db
-                    if margin_db >= self._hysteresis_db:
-                        current_name = current_probe.name
-                        new_name = self._probes[best_idx].name
-                        print(f"  Auto-switch: {current_name} -> {new_name} "
-                              f"({current_db:.1f} dB -> {best_db:.1f} dB)")
-                        self._current_index = best_idx
-                        self._switch_event.set()
-                        switch = True
-                    else:
-                        print(f"    (no candidate loud enough by {self._hysteresis_db:.0f} dB)")
+            # Always probe candidates every cycle so we can detect when the
+            # current device is worse than a candidate.  Hysteresis gating
+            # on the switch decision prevents flip-flopping.
+            if device_changed and new_devices:
+                print(f"  Device list changed (new={new_devices}), probing candidates...")
             else:
-                # Current device still active — skip probing, no output.
-                continue
+                print(f"  Scanning for better audio device...")
+
+            self._probe_all()
+
+            best_idx = self._current_index
+            best_db = current_db
+
+            # Re-read current energy AFTER probing to get the live value.
+            # The main callback may have updated it since we computed
+            # current_db above.  Also, the probe's own _last_active
+            # was set during probing if it saw energy > threshold.
+            current_db = self._rms_to_db(current_probe.energy)
+
+            for i, probe in enumerate(self._probes):
+                if i == self._current_index:
+                    continue
+                p_db = self._rms_to_db(probe.energy)
+                print(f", {probe.name[:20]}={p_db:.1f} dB", end="")
+                if p_db > best_db and p_db > self._rms_to_db(self._threshold):
+                    best_idx = i
+                    best_db = p_db
+            print()
+
+            switch = False
+            if device_changed and new_devices:
+                # Device list changed + new devices found.
+                # Only switch to the new device if it's a known-good monitor source
+                # (priority name match) OR if it already has audio signal.
+                # Avoid switching to raw ALSA hw devices with no signal — those
+                # are typically mic inputs that will never carry system audio.
+                _priority_pats = [
+                    "monitor", "firefox", "chromium",
+                    "easy effects", "easyeffects", "equalizer", "output level",
+                ]
+                best_new_probe = None
+                for probe in self._probes:
+                    if probe.device not in new_devices:
+                        continue
+                    name_lower = probe.name.lower()
+                    p_db = self._rms_to_db(probe.energy)
+                    is_priority = any(p in name_lower for p in _priority_pats)
+                    has_signal = p_db > self._rms_to_db(self._threshold)
+                    if is_priority or has_signal:
+                        best_new_probe = probe
+                        break
+
+                if best_new_probe is not None:
+                    current_name = current_probe.name
+                    new_name = best_new_probe.name
+                    print(f"  Auto-switch (new device): {current_name} -> {new_name}")
+                    self._current_index = self._probes.index(best_new_probe)
+                    self._switch_event.set()
+                    switch = True
+                else:
+                    print(f"  (new device(s) found but none are priority sources or have signal — keeping current)")
+            elif best_idx != self._current_index:
+                margin_db = best_db - current_db
+                # Bypass hysteresis when the current device is effectively
+                # silent — there's nothing to "hold" onto so we should
+                # immediately switch to the first loud candidate.
+                current_silent = current_db < self._rms_to_db(self._threshold)
+                if margin_db >= self._hysteresis_db or (current_silent and best_db > self._rms_to_db(self._threshold)):
+                    current_name = current_probe.name
+                    new_name = self._probes[best_idx].name
+                    print(f"  Auto-switch: {current_name} -> {new_name} "
+                          f"({current_db:.1f} dB -> {best_db:.1f} dB)")
+                    self._current_index = best_idx
+                    self._switch_event.set()
+                    switch = True
+                else:
+                    print(f"    (no candidate loud enough by {self._hysteresis_db:.0f} dB; "
+                          f"margin={margin_db:.1f} dB, best_idx={best_idx})")
+
+            # If ALL candidates are silent, speed up device-list refresh so a new
+            # PipeWire monitor source (e.g. Firefox starting to play) is detected
+            # within one probe cycle instead of waiting up to refresh_interval seconds.
+            all_silent = (current_db < self._rms_to_db(self._threshold) and
+                          best_db < self._rms_to_db(self._threshold))
+            if all_silent:
+                self._refresh_interval = self._interval  # refresh every probe cycle
+            else:
+                # Back off to the normal refresh cadence once we have signal.
+                self._refresh_interval = self._interval * 4
 
     # -- public API -------------------------------------------------------
 
@@ -1034,28 +935,73 @@ class AudioVisualizer:
         self._wasapi_loopback = False
         return None
 
+    @staticmethod
+    def _setup_pactl_monitor() -> Optional[str]:
+        """Use pactl to find the default output sink's monitor source and set it
+        as the PipeWire default source.  Returns the monitor source name or None.
+
+        This ensures sounddevice's default input (device=None) routes to the
+        output monitor, capturing all system audio regardless of which app
+        is playing.
+        """
+        try:
+            import subprocess
+            r = subprocess.run(
+                ["pactl", "get-default-sink"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if r.returncode != 0 or not r.stdout.strip():
+                return None
+            monitor = r.stdout.strip() + ".monitor"
+            subprocess.run(
+                ["pactl", "set-default-source", monitor],
+                capture_output=True, text=True, timeout=2,
+            )
+            return monitor
+        except Exception:
+            return None
+
     def _find_device_monitor(self) -> Optional[object]:
         """Find a PipeWire tap source for system audio capture (Linux).
 
-        PipeWire tap sources appear in sounddevice's device list with
-        descriptive names (e.g. "Easy Effects Sink", "Equalizer (Speakers)")
-        but do NOT contain "monitor" in their name.  pactl .monitor names
-        are NOT usable with sounddevice.
+        Preferred path: use pactl to point the PipeWire default source at the
+        output-sink monitor (capturing all system audio), then return None so
+        sounddevice opens the default input — which now tracks that monitor.
+
+        Fallback: scan sounddevice's device list for well-known tap-source names
+        (Easy Effects, equalizer side-chains, etc.).  Browser null-sink monitors
+        (e.g. a "Firefox" virtual device) are intentionally excluded here because
+        browsers typically route audio to the main output sink, not a null-sink;
+        the pactl path above picks that up automatically.
         """
         devices = sd.query_devices()
 
-        # Priority list of well-known PipeWire tap source names for
-        # capturing system audio (the sink/tap that has the full mix).
+        # --- pactl path: set the default source to the output monitor ----------
+        monitor_name = self._setup_pactl_monitor()
+        if monitor_name is not None:
+            # Prefer a sounddevice device whose name contains "monitor" if one
+            # is explicitly listed (some setups expose it as a named device).
+            for dev in devices:
+                if dev["max_input_channels"] == 0:
+                    continue
+                if "monitor" in dev["name"].lower() and dev["name"].lower() not in ("pipewire", "default"):
+                    print(f"  Auto-selected output monitor: {dev['name']}")
+                    return dev["index"]
+            # No named monitor device — use the default input, which pactl just
+            # pointed at the monitor.
+            print(f"  Auto-selected output monitor (default source): {monitor_name}")
+            return None
+
+        # --- sounddevice priority scan (no pactl available) -------------------
         priority_names = [
             "easy effects sink",
             "easyeffects sink",
             "equalizer",
             "output level meter",
-            "firefox",
+            "monitor",
             "chromium",
         ]
 
-        # Iterate priority list first — pick the best-known tap source.
         for pri in priority_names:
             for dev in devices:
                 if dev["max_input_channels"] == 0:
@@ -1064,20 +1010,11 @@ class AudioVisualizer:
                     print(f"  Auto-selected audio device: {dev['name']}")
                     return dev["index"]
 
-        # Fallback: any PipeWire tap with input channels (but not
-        # the generic "pipewire" or "default" proxy, and not a microphone).
-        for dev in devices:
-            if dev["max_input_channels"] == 0:
-                continue
-            name_lower = dev["name"].lower()
-            if name_lower in ("pipewire", "default"):
-                continue
-            if not self._allow_mics and _is_microphone(dev["name"]):
-                continue
-            print(f"  Auto-selected audio device (fallback): {dev['name']}")
-            return dev["index"]
-
-        print("  Warning: no usable monitor source found — falling back to default input (microphone)")
+        # --- last-resort fallback ---------------------------------------------
+        # Return None: sounddevice will use the system default input.  On most
+        # PipeWire desktops that defaults to the output monitor, so this is
+        # usually correct even without pactl.
+        print("  Warning: no usable monitor source found — falling back to default input")
         print("  Tip: run --list-devices to see sounddevice inputs, or set audio.source in config.yaml")
         return None
 
@@ -1086,14 +1023,26 @@ class AudioVisualizer:
         Return a list of (device, name) tuples for all usable input devices,
         excluding *exclude*.  Microphone devices are excluded by default;
         use --allow-mics to include them.
+
+        The "default" sounddevice device is included when the initial device is
+        not the default, because pactl may have configured it to point at the
+        output monitor — making it the best fallback for system-audio capture.
         """
         candidates: list[tuple[object, str]] = []
         devices = sd.query_devices()
+        default_included = False
         for dev in devices:
             if dev["index"] == exclude or dev["max_input_channels"] == 0:
                 continue
             name_lower = dev["name"].lower()
-            if name_lower in ("pipewire", "default"):
+            if name_lower == "pipewire":
+                continue
+            # Include "default" only once and only when the current device is not
+            # the default (so we can auto-switch to the output monitor via pactl).
+            if name_lower == "default":
+                if exclude is not None and not default_included:
+                    candidates.append((dev["index"], "default (output monitor)"))
+                    default_included = True
                 continue
             if not self._allow_mics and _is_microphone(dev["name"]):
                 continue
@@ -1122,7 +1071,8 @@ class AudioVisualizer:
         # For regular input, verify the wanted rate is actually supported first.
         if not self._wasapi_loopback:
             try:
-                sd.check_input_settings(device=device, channels=1, samplerate=wanted)
+                with _suppress_stderr():
+                    sd.check_input_settings(device=device, channels=1, samplerate=wanted)
                 return wanted
             except Exception:
                 pass
@@ -1146,8 +1096,9 @@ class AudioVisualizer:
     def _open_stream(self, device, sample_rate: int):
         """Open and start the main audio InputStream.
 
-        Tries multiple sample rates because some ALSA devices report a native
-        rate they don't actually support.
+        Tries multiple sample rates and channel counts (stereo then mono)
+        because PipeWire monitor sources may be stereo while hardware
+        inputs are mono.
 
         Returns (stream, actual_rate).
         """
@@ -1156,21 +1107,22 @@ class AudioVisualizer:
         with _suppress_stderr():
             extra = sd.WasapiSettings(loopback=True) if self._wasapi_loopback else None
             candidates = (sample_rate, 48000, 44100, 48001, 44101)
-            for rate in candidates:
-                try:
-                    stream = sd.InputStream(
-                        device=device,
-                        channels=1,
-                        samplerate=rate,
-                        blocksize=256,
-                        dtype=np.float32,
-                        callback=self._audio_callback,
-                        extra_settings=extra,
-                    )
-                    stream.start()
-                    return stream, rate
-                except Exception:
-                    pass
+            for channels in (2, 1):
+                for rate in candidates:
+                    try:
+                        stream = sd.InputStream(
+                            device=device,
+                            channels=channels,
+                            samplerate=rate,
+                            blocksize=256,
+                            dtype=np.float32,
+                            callback=self._audio_callback,
+                            extra_settings=extra,
+                        )
+                        stream.start()
+                        return stream, rate
+                    except Exception:
+                        pass
             # None of the rates worked — raise the last error
             stream = sd.InputStream(
                 device=device,

@@ -94,7 +94,7 @@ visualization:
   bar_fade_min: 40
 
   # Peak indicators — a bright pixel that stays at the widest recent bar position.
-  peaks: false 
+  peaks: true
   peak_hold_frames: 15   # frames to hold at the peak before starting to fall
   peak_fall_speed: 1.0   # columns per frame the peak dot retreats after hold expires
   peak_fade_speed: 13.0   # brightness units per frame the peak dot fades (0-255 scale; 0 = no fade)

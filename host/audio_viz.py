@@ -139,13 +139,8 @@ class Panel:
     @staticmethod
     def _pack_nibbles(values: list[int]) -> bytes:
         """Pack NUM_BANDS values (0-15 each) into 17 bytes, low nibble first."""
-        out = bytearray(17)
-        for i, v in enumerate(values[:NUM_BANDS]):
-            if i % 2 == 0:
-                out[i // 2] = v & 0x0F
-            else:
-                out[i // 2] |= (v & 0x0F) << 4
-        return bytes(out)
+        arr = np.array(values[:NUM_BANDS], dtype=np.uint8) & 0x0F
+        return (arr[0::2] | (arr[1::2] << 4)).tobytes()
 
     def send_eq(self, heights: list[int], peaks: list[int], peak_brightness: list[int]) -> None:
         h = [max(0, min(BAR_MAX, v)) for v in heights[:NUM_BANDS]]
@@ -819,15 +814,17 @@ class AudioVisualizer:
             self._num_bars + self._bass_skip, self._freq_min, self._freq_max,
             self._fft_size, self._sample_rate,
         )
-        self._bin_masks = all_masks[self._bass_skip:]
+        self._rebuild_fft_bins(all_masks[self._bass_skip:])
         self._smooth_left  = np.zeros(self._num_bars, dtype=float)
         self._smooth_right = np.zeros(self._num_bars, dtype=float)
         self._peak_tracker_left  = PeakTracker(self._num_bars, peak_hold, peak_fall, peak_fade)
         self._peak_tracker_right = PeakTracker(self._num_bars, peak_hold, peak_fall, peak_fade)
 
         # Audio ring buffers — one per stereo channel (filled by callback, drained by main thread)
+        # Implemented as a circular buffer; _ring_ptr is the next-write position.
         self._ring_left  = np.zeros(self._fft_size, dtype=np.float32)
         self._ring_right = np.zeros(self._fft_size, dtype=np.float32)
+        self._ring_ptr   = 0
         self._audio_q: queue.Queue[tuple[np.ndarray, np.ndarray]] = queue.Queue(maxsize=8)
 
         # Current probe for auto-switch energy tracking (set before stream open)
@@ -854,6 +851,27 @@ class AudioVisualizer:
                 self._left_panel = panel
             else:
                 self._right_panel = panel
+
+    # ------------------------------------------------------------------
+    # FFT bin state helpers
+    # ------------------------------------------------------------------
+
+    def _rebuild_fft_bins(self, masks: list[np.ndarray]) -> None:
+        """Pre-compute vectorized bin-to-band mapping from boolean masks.
+
+        Stores a per-FFT-bin integer assignment array so _process can use
+        np.bincount instead of iterating over 34 boolean masks per frame.
+        """
+        self._bin_masks = masks
+        n_bins = self._fft_size // 2 + 1
+        assign = np.full(n_bins, -1, dtype=np.int32)
+        for i, mask in enumerate(masks):
+            assign[mask] = i
+        valid = assign >= 0
+        counts = np.bincount(assign[valid], minlength=self._num_bars).astype(np.float32)
+        self._bin_assign        = assign
+        self._bin_assign_valid  = valid
+        self._bin_assign_counts = counts
 
     # ------------------------------------------------------------------
     # Audio callback — runs in a separate C thread; keep it minimal
@@ -894,10 +912,12 @@ class AudioVisualizer:
         spectrum = np.abs(np.fft.rfft(windowed, n=self._fft_size))
         db = 20.0 * np.log10(spectrum + 1e-10)
 
-        raw = np.full(self._num_bars, self._db_floor, dtype=float)
-        for i, mask in enumerate(self._bin_masks):
-            if mask.any():
-                raw[i] = db[mask].mean()
+        valid   = self._bin_assign_valid
+        assigns = self._bin_assign[valid]
+        sums    = np.bincount(assigns, weights=db[valid], minlength=self._num_bars)
+        raw     = np.where(self._bin_assign_counts > 0,
+                           sums / self._bin_assign_counts,
+                           self._db_floor)
 
         # Map dB range to [0, 1]
         normalized = np.clip((raw - self._db_floor) / (self._db_ceil - self._db_floor), 0.0, 1.0)
@@ -1100,11 +1120,12 @@ class AudioVisualizer:
         self._sample_rate = native
         self._ring_left  = np.zeros(self._fft_size, dtype=np.float32)
         self._ring_right = np.zeros(self._fft_size, dtype=np.float32)
+        self._ring_ptr   = 0
         all_masks = make_log_bins(
             self._num_bars + self._bass_skip, self._freq_min, self._freq_max,
             self._fft_size, native,
         )
-        self._bin_masks = all_masks[self._bass_skip:]
+        self._rebuild_fft_bins(all_masks[self._bass_skip:])
         self._hann = np.hanning(self._fft_size).astype(np.float32)
         return native
 
@@ -1166,6 +1187,7 @@ class AudioVisualizer:
         sample_rate = self._resolve_sample_rate(new_device)
         self._ring_left  = np.zeros(self._fft_size, dtype=np.float32)
         self._ring_right = np.zeros(self._fft_size, dtype=np.float32)
+        self._ring_ptr   = 0
         self._smooth_left[:]  = 0.0
         self._smooth_right[:] = 0.0
         stream, actual_rate = self._open_stream(new_device, sample_rate)
@@ -1177,7 +1199,7 @@ class AudioVisualizer:
                 self._num_bars + self._bass_skip, self._freq_min, self._freq_max,
                 self._fft_size, actual_rate,
             )
-            self._bin_masks = all_masks[self._bass_skip:]
+            self._rebuild_fft_bins(all_masks[self._bass_skip:])
 
     # ------------------------------------------------------------------
     # Main loop
@@ -1267,7 +1289,7 @@ class AudioVisualizer:
                 self._num_bars + self._bass_skip, self._freq_min, self._freq_max,
                 self._fft_size, actual_rate,
             )
-            self._bin_masks = all_masks[self._bass_skip:]
+            self._rebuild_fft_bins(all_masks[self._bass_skip:])
 
         last_frame = time.monotonic()
 
@@ -1295,37 +1317,53 @@ class AudioVisualizer:
                         self._current_probe._last_active = time.monotonic()
                         print("  Resume streaming...")
 
-                # Accumulate audio into per-channel ring buffers
+                # Accumulate audio into per-channel ring buffers (circular, no roll)
                 try:
                     left_chunk, right_chunk = self._audio_q.get(timeout=0.2)
                 except queue.Empty:
                     continue
 
-                n = len(left_chunk)
-                self._ring_left  = np.roll(self._ring_left,  -n)
-                self._ring_left[-n:]  = left_chunk
-                self._ring_right = np.roll(self._ring_right, -n)
-                self._ring_right[-n:] = right_chunk
+                n   = len(left_chunk)
+                ptr = self._ring_ptr
+                end = ptr + n
+                if end <= self._fft_size:
+                    self._ring_left[ptr:end]  = left_chunk
+                    self._ring_right[ptr:end] = right_chunk
+                else:
+                    split = self._fft_size - ptr
+                    self._ring_left[ptr:]      = left_chunk[:split]
+                    self._ring_left[:n - split] = left_chunk[split:]
+                    self._ring_right[ptr:]      = right_chunk[:split]
+                    self._ring_right[:n - split] = right_chunk[split:]
+                self._ring_ptr = end % self._fft_size
 
                 now = time.monotonic()
                 if now - last_frame < frame_interval:
                     continue
                 last_frame = now
 
-                bars_l, peaks_l = self._process(self._ring_left,  self._smooth_left)
-                bars_r, peaks_r = self._process(self._ring_right, self._smooth_right)
+                # Unroll circular buffer into a contiguous window for FFT
+                ptr = self._ring_ptr
+                if ptr == 0:
+                    left_window  = self._ring_left
+                    right_window = self._ring_right
+                else:
+                    left_window  = np.concatenate((self._ring_left[ptr:],  self._ring_left[:ptr]))
+                    right_window = np.concatenate((self._ring_right[ptr:], self._ring_right[:ptr]))
+
+                bars_l, peaks_l = self._process(left_window,  self._smooth_left)
+                bars_r, peaks_r = self._process(right_window, self._smooth_right)
 
                 def _build_eq(bars, peaks, tracker):
-                    h = [0] * NUM_BANDS
-                    p = [0] * NUM_BANDS
-                    b = [0] * NUM_BANDS
-                    for i in range(self._num_bars):
-                        h[i] = int(bars[i])
+                    pad = NUM_BANDS - self._num_bars
+                    h = bars.tolist() + [0] * pad
                     if self._peaks_enabled:
                         pa, pb = tracker.update(peaks)
-                        for i in range(self._num_bars):
-                            p[i] = int(pa[i])
-                            b[i] = int(pb[i])
+                        p = pa.tolist() + [0] * pad
+                        b = pb.tolist() + [0] * pad
+                    else:
+                        p = [0] * NUM_BANDS
+                        b = [0] * NUM_BANDS
                     return h, p, b
 
                 h_l, p_l, b_l = _build_eq(bars_l, peaks_l, self._peak_tracker_left)

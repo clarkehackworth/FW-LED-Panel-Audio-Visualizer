@@ -820,12 +820,15 @@ class AudioVisualizer:
             self._fft_size, self._sample_rate,
         )
         self._bin_masks = all_masks[self._bass_skip:]
-        self._smooth = np.zeros(self._num_bars, dtype=float)
-        self._peak_tracker = PeakTracker(self._num_bars, peak_hold, peak_fall, peak_fade)
+        self._smooth_left  = np.zeros(self._num_bars, dtype=float)
+        self._smooth_right = np.zeros(self._num_bars, dtype=float)
+        self._peak_tracker_left  = PeakTracker(self._num_bars, peak_hold, peak_fall, peak_fade)
+        self._peak_tracker_right = PeakTracker(self._num_bars, peak_hold, peak_fall, peak_fade)
 
-        # Audio ring buffer (filled by callback, drained by main thread)
-        self._ring = np.zeros(self._fft_size, dtype=np.float32)
-        self._audio_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=8)
+        # Audio ring buffers — one per stereo channel (filled by callback, drained by main thread)
+        self._ring_left  = np.zeros(self._fft_size, dtype=np.float32)
+        self._ring_right = np.zeros(self._fft_size, dtype=np.float32)
+        self._audio_q: queue.Queue[tuple[np.ndarray, np.ndarray]] = queue.Queue(maxsize=8)
 
         # Current probe for auto-switch energy tracking (set before stream open)
         self._current_probe: Optional[_ProbeDevice] = None
@@ -834,6 +837,8 @@ class AudioVisualizer:
         ext_map  = {"left": 0, "right": 1}   # bar extension direction
         freq_map = {"top": 0, "bottom": 2}    # low-freq position (bit 1)
         self._panels: list[Panel] = []
+        self._left_panel:  Optional[Panel] = None
+        self._right_panel: Optional[Panel] = None
         for side in ("left_panel", "right_panel"):
             pcfg = cfg.get(side, {})
             port = pcfg.get("port")
@@ -843,21 +848,31 @@ class AudioVisualizer:
             flags |= freq_map.get(pcfg.get("freq_start", "top"), 0)
             if pcfg.get("mirror", False):
                 flags ^= 0x01  # flip bar direction
-            self._panels.append(Panel(port, flags, self._bar_fade_min))
+            panel = Panel(port, flags, self._bar_fade_min)
+            self._panels.append(panel)
+            if side == "left_panel":
+                self._left_panel = panel
+            else:
+                self._right_panel = panel
 
     # ------------------------------------------------------------------
     # Audio callback — runs in a separate C thread; keep it minimal
     # ------------------------------------------------------------------
 
     def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
-        mono = indata[:, 0] if indata.ndim > 1 else indata.ravel()
+        if indata.ndim > 1 and indata.shape[1] >= 2:
+            left  = indata[:, 0].copy()
+            right = indata[:, 1].copy()
+        else:
+            left = right = (indata[:, 0] if indata.ndim > 1 else indata.ravel()).copy()
         try:
-            self._audio_q.put_nowait(mono.copy())
+            self._audio_q.put_nowait((left, right))
         except queue.Full:
             pass  # drop chunk — main loop is behind, visual glitch is acceptable
 
-        # Track current device energy for auto-switch comparison
+        # Track current device energy for auto-switch comparison (use L+R mean)
         if self._current_probe is not None:
+            mono = (left + right) * 0.5
             energy = float(np.sqrt(np.mean(mono ** 2)))
             now = time.monotonic()
             with self._current_probe._lock:
@@ -870,8 +885,11 @@ class AudioVisualizer:
     # FFT + bar computation
     # ------------------------------------------------------------------
 
-    def _process(self, samples: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Return (bar_lengths, peak_lengths), each an int array clipped to [0, BAR_MAX]."""
+    def _process(self, samples: np.ndarray, smooth: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return (bar_lengths, peak_lengths), each an int array clipped to [0, BAR_MAX].
+
+        `smooth` is updated in-place — pass _smooth_left or _smooth_right.
+        """
         windowed = samples * self._hann
         spectrum = np.abs(np.fft.rfft(windowed, n=self._fft_size))
         db = 20.0 * np.log10(spectrum + 1e-10)
@@ -885,14 +903,14 @@ class AudioVisualizer:
         normalized = np.clip((raw - self._db_floor) / (self._db_ceil - self._db_floor), 0.0, 1.0)
 
         # Attack-fast / decay-slow smoothing
-        rising = normalized > self._smooth
-        self._smooth[rising] = (self._attack * normalized[rising]
-                                + (1.0 - self._attack) * self._smooth[rising])
-        self._smooth[~rising] *= self._decay
+        rising = normalized > smooth
+        smooth[rising] = (self._attack * normalized[rising]
+                          + (1.0 - self._attack) * smooth[rising])
+        smooth[~rising] *= self._decay
 
         # Bars use gamma curve; peaks stay linear so they always reach full brightness
-        bars  = np.clip((self._smooth ** self._scale * BAR_MAX).astype(int), 0, BAR_MAX)
-        peaks = np.clip((self._smooth * BAR_MAX).astype(int), 0, BAR_MAX)
+        bars  = np.clip((smooth ** self._scale * BAR_MAX).astype(int), 0, BAR_MAX)
+        peaks = np.clip((smooth * BAR_MAX).astype(int), 0, BAR_MAX)
         return bars, peaks
 
     # ------------------------------------------------------------------
@@ -1080,7 +1098,8 @@ class AudioVisualizer:
         # Rebuild FFT state for the native rate
         print(f"  Sample rate {wanted} Hz not supported — using device native {native} Hz")
         self._sample_rate = native
-        self._ring = np.zeros(self._fft_size, dtype=np.float32)
+        self._ring_left  = np.zeros(self._fft_size, dtype=np.float32)
+        self._ring_right = np.zeros(self._fft_size, dtype=np.float32)
         all_masks = make_log_bins(
             self._num_bars + self._bass_skip, self._freq_min, self._freq_max,
             self._fft_size, native,
@@ -1145,8 +1164,10 @@ class AudioVisualizer:
             except Exception:
                 pass
         sample_rate = self._resolve_sample_rate(new_device)
-        self._ring = np.zeros(self._fft_size, dtype=np.float32)
-        self._smooth[:] = 0.0
+        self._ring_left  = np.zeros(self._fft_size, dtype=np.float32)
+        self._ring_right = np.zeros(self._fft_size, dtype=np.float32)
+        self._smooth_left[:]  = 0.0
+        self._smooth_right[:] = 0.0
         stream, actual_rate = self._open_stream(new_device, sample_rate)
         self._stream = stream
         if actual_rate != sample_rate:
@@ -1274,38 +1295,46 @@ class AudioVisualizer:
                         self._current_probe._last_active = time.monotonic()
                         print("  Resume streaming...")
 
-                # Accumulate audio into ring buffer
+                # Accumulate audio into per-channel ring buffers
                 try:
-                    chunk = self._audio_q.get(timeout=0.2)
+                    left_chunk, right_chunk = self._audio_q.get(timeout=0.2)
                 except queue.Empty:
                     continue
 
-                n = len(chunk)
-                self._ring = np.roll(self._ring, -n)
-                self._ring[-n:] = chunk
+                n = len(left_chunk)
+                self._ring_left  = np.roll(self._ring_left,  -n)
+                self._ring_left[-n:]  = left_chunk
+                self._ring_right = np.roll(self._ring_right, -n)
+                self._ring_right[-n:] = right_chunk
 
                 now = time.monotonic()
                 if now - last_frame < frame_interval:
                     continue
                 last_frame = now
 
-                bars, peaks = self._process(self._ring)
+                bars_l, peaks_l = self._process(self._ring_left,  self._smooth_left)
+                bars_r, peaks_r = self._process(self._ring_right, self._smooth_right)
 
-                # Pad to full panel height (34 frequency bands)
-                h_full = [0] * NUM_BANDS
-                p_full = [0] * NUM_BANDS
-                b_full = [0] * NUM_BANDS
-                for i in range(self._num_bars):
-                    h_full[i] = int(bars[i])
-
-                if self._peaks_enabled:
-                    peaks_arr, peak_bright = self._peak_tracker.update(peaks)
+                def _build_eq(bars, peaks, tracker):
+                    h = [0] * NUM_BANDS
+                    p = [0] * NUM_BANDS
+                    b = [0] * NUM_BANDS
                     for i in range(self._num_bars):
-                        p_full[i] = int(peaks_arr[i])
-                        b_full[i] = int(peak_bright[i])
+                        h[i] = int(bars[i])
+                    if self._peaks_enabled:
+                        pa, pb = tracker.update(peaks)
+                        for i in range(self._num_bars):
+                            p[i] = int(pa[i])
+                            b[i] = int(pb[i])
+                    return h, p, b
 
-                for panel in self._panels:
-                    panel.send_eq(h_full, p_full, b_full)
+                h_l, p_l, b_l = _build_eq(bars_l, peaks_l, self._peak_tracker_left)
+                h_r, p_r, b_r = _build_eq(bars_r, peaks_r, self._peak_tracker_right)
+
+                if self._left_panel:
+                    self._left_panel.send_eq(h_l, p_l, b_l)
+                if self._right_panel:
+                    self._right_panel.send_eq(h_r, p_r, b_r)
 
         except KeyboardInterrupt:
             print("\nStopping...")

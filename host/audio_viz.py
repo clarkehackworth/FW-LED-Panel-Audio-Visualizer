@@ -287,7 +287,7 @@ class _ProbeDevice:
         result = {"energy": 0.0}
 
         def _cb(indata, frames, time_info, status):
-            if status:
+            if status and "input overflow" not in status and "output underflow" not in status:
                 print(f"  [probe] status for {self.device}: {status}")
             if indata.ndim < 2 or indata.shape[1] < 1:
                 return
@@ -933,8 +933,10 @@ class AudioVisualizer:
         valid   = self._bin_assign_valid
         assigns = self._bin_assign[valid]
         sums    = np.bincount(assigns, weights=db[valid], minlength=self._num_bars)
+        # np.where evaluates both branches, so guard against div-by-zero
+        counts  = np.where(self._bin_assign_counts > 0, self._bin_assign_counts, 1)
         raw     = np.where(self._bin_assign_counts > 0,
-                           sums / self._bin_assign_counts,
+                           sums / counts,
                            self._db_floor)
         for z, src in self._zero_band_sources.items():
             raw[z] = raw[src]

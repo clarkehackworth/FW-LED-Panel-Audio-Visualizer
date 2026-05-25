@@ -240,6 +240,16 @@ _MICROPHONE_PATTERNS = [
     "pulse_input",
 ]
 
+# Internal processing nodes and other visualizers that should never be used as
+# an audio source.  "easy effects filter" is an intermediate EQ chain node
+# (not the final output), and "spectrum" is another audio analyzer that would
+# create a feedback loop if used as our source.
+_EXCLUDED_DEVICE_PATTERNS = [
+    "easy effects filter",
+    "easyeffects filter",
+    "spectrum",
+]
+
 def _is_microphone(name: str) -> bool:
     """Return True if *name* looks like a microphone / capture device."""
     lower = name.lower()
@@ -250,6 +260,11 @@ def _is_microphone(name: str) -> bool:
     if lower == "default" or lower.startswith("default input"):
         return True
     return False
+
+def _is_excluded_device(name: str) -> bool:
+    """Return True if *name* is a known bad candidate (internal node or other visualizer)."""
+    lower = name.lower()
+    return any(pat in lower for pat in _EXCLUDED_DEVICE_PATTERNS)
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +317,10 @@ class _ProbeDevice:
             for d in sd.query_devices():
                 if d["max_input_channels"] == 0:
                     continue
-                if dev in d["name"].lower():
+                dname = d["name"]
+                if dname is None:
+                    continue
+                if isinstance(dev, str) and dev in dname.lower():
                     return d["index"]
             print(f"  [probe] device name '{dev}' not found in PortAudio devices")
             return None
@@ -471,6 +489,8 @@ class AudioMonitor:
             if name_lower in ("pipewire", "default"):
                 continue
             if not self._allow_mics and _is_microphone(dev["name"]):
+                continue
+            if _is_excluded_device(dev["name"]):
                 continue
             pa_new_candidates.append((dev["index"], dev["name"]))
 
@@ -709,7 +729,14 @@ class AudioMonitor:
                     # silent — there's nothing to "hold" onto so we should
                     # immediately switch to the first loud candidate.
                     current_silent = current_db < self._rms_to_db(self._threshold)
-                    if margin_db >= self._hysteresis_db or (current_silent and best_db > self._rms_to_db(self._threshold)):
+                    # Only allow margin-based switching when the current device
+                    # has been silent long enough (can_switch).  This prevents
+                    # switching away from a good active source just because
+                    # another node briefly peaks louder (e.g. Spectrum catching
+                    # the same audio, or a device-list refresh forcing a probe).
+                    can_margin_switch = margin_db >= self._hysteresis_db and can_switch
+                    can_silent_switch = current_silent and best_db > self._rms_to_db(self._threshold)
+                    if can_margin_switch or can_silent_switch:
                         current_name = current_probe.name
                         new_name = self._probes[best_idx].name
                         print(f"  Auto-switch: {current_name} -> {new_name} "
@@ -719,7 +746,7 @@ class AudioMonitor:
                         switch = True
                     else:
                         print(f"    (no candidate loud enough by {self._hysteresis_db:.0f} dB; "
-                              f"margin={margin_db:.1f} dB, best_idx={best_idx})")
+                              f"margin={margin_db:.1f} dB, best_idx={best_idx}, can_switch={can_switch})")
 
                 # If ALL candidates are silent, speed up device-list refresh so a new
                 # PipeWire monitor source (e.g. Firefox starting to play) is detected
@@ -1024,17 +1051,39 @@ class AudioVisualizer:
     def _find_device_monitor(self) -> Optional[object]:
         """Find a PipeWire tap source for system audio capture (Linux).
 
-        Preferred path: use pactl to point the PipeWire default source at the
-        output-sink monitor (capturing all system audio), then return None so
-        sounddevice opens the default input — which now tracks that monitor.
-
-        Fallback: scan sounddevice's device list for well-known tap-source names
-        (Easy Effects, equalizer side-chains, etc.).  Browser null-sink monitors
-        (e.g. a "Firefox" virtual device) are intentionally excluded here because
-        browsers typically route audio to the main output sink, not a null-sink;
-        the pactl path above picks that up automatically.
+        Priority order:
+        1. Named tap sources (Easy Effects, Equalizer, output-level meters, etc.)
+           — these carry clean post-processed audio with no noise floor issues.
+        2. pactl: set the PipeWire default source to the output-sink monitor and
+           return None so sounddevice opens that default input.  Captures all
+           system audio when no named tap source is present.
+        3. Last resort: sounddevice default input (usually the output monitor on
+           PipeWire desktops even without pactl).
         """
         devices = sd.query_devices()
+
+        # --- priority scan: prefer named tap/post-processing sources ----------
+        # These give a cleaner signal than the raw output monitor (no noise
+        # floor bleed from other PipeWire nodes).  "easy effects source" is
+        # the post-EQ output; prefer it over "easy effects sink" (pre-EQ).
+        priority_names = [
+            "easy effects source",
+            "easyeffects source",
+            "easy effects sink",
+            "easyeffects sink",
+            "equalizer",
+            "output level meter",
+            "monitor",
+            "chromium",
+        ]
+
+        for pri in priority_names:
+            for dev in devices:
+                if dev["max_input_channels"] == 0:
+                    continue
+                if pri in dev["name"].lower():
+                    print(f"  Auto-selected audio device: {dev['name']}")
+                    return dev["index"]
 
         # --- pactl path: set the default source to the output monitor ----------
         monitor_name = self._setup_pactl_monitor()
@@ -1052,28 +1101,7 @@ class AudioVisualizer:
             print(f"  Auto-selected output monitor (default source): {monitor_name}")
             return None
 
-        # --- sounddevice priority scan (no pactl available) -------------------
-        priority_names = [
-            "easy effects sink",
-            "easyeffects sink",
-            "equalizer",
-            "output level meter",
-            "monitor",
-            "chromium",
-        ]
-
-        for pri in priority_names:
-            for dev in devices:
-                if dev["max_input_channels"] == 0:
-                    continue
-                if pri in dev["name"].lower():
-                    print(f"  Auto-selected audio device: {dev['name']}")
-                    return dev["index"]
-
         # --- last-resort fallback ---------------------------------------------
-        # Return None: sounddevice will use the system default input.  On most
-        # PipeWire desktops that defaults to the output monitor, so this is
-        # usually correct even without pactl.
         print("  Warning: no usable monitor source found — falling back to default input")
         print("  Tip: run --list-devices to see sounddevice inputs, or set audio.source in config.yaml")
         return None
@@ -1105,6 +1133,8 @@ class AudioVisualizer:
                     default_included = True
                 continue
             if not self._allow_mics and _is_microphone(dev["name"]):
+                continue
+            if _is_excluded_device(dev["name"]):
                 continue
             candidates.append((dev["index"], dev["name"]))
 

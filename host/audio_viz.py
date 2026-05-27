@@ -67,19 +67,27 @@ import yaml
 # PortAudio writes error messages directly to C-level stderr (fd 2) via
 # vfprintf(stderr, ...), which bypasses Python's sys.stderr entirely.
 # We must redirect at the raw file descriptor level using os.dup2.
+#
+# _stderr_lock serializes all fd-2 redirections across threads.  Without it,
+# two concurrent _suppress_stderr() calls (e.g. a probe thread + a main-thread
+# device switch) race to restore the original fd, corrupting the fd table and
+# eventually crashing PortAudio.
+
+_stderr_lock = threading.Lock()
 
 @contextmanager
 def _suppress_stderr():
     """Silence PortAudio/ALSA errors at the C-level stderr (fd 2)."""
-    devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    old_fd2 = os.dup(2)
-    try:
-        os.dup2(devnull_fd, 2)
-        yield
-    finally:
-        os.dup2(old_fd2, 2)
-        os.close(devnull_fd)
-        os.close(old_fd2)
+    with _stderr_lock:
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        old_fd2 = os.dup(2)
+        try:
+            os.dup2(devnull_fd, 2)
+            yield
+        finally:
+            os.dup2(old_fd2, 2)
+            os.close(devnull_fd)
+            os.close(old_fd2)
 
 
 # ---------------------------------------------------------------------------
@@ -105,14 +113,26 @@ class Panel:
 
     def __init__(self, port: str, flags: int, fade_min: int) -> None:
         self.port = port
+        self._configured_port = port  # original port from config; tried first on reconnect
         # flags bit 0: 0=left-to-right, 1=right-to-left
         # flags bit 1: 0=low-freq at top, 1=low-freq at bottom
         self._flags = flags & 0x03
         self._fade_min = max(0, min(255, fade_min))
         self._ser: Optional[serial.Serial] = None
         self._lock = threading.Lock()
+        self._connected = False
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
 
     def connect(self) -> None:
+        # Close any stale handle before (re)opening
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
         self._ser = serial.Serial(self.port, 115200, timeout=0.1, write_timeout=2.0)
         # Flush any stale data from the device
         self._ser.reset_input_buffer()
@@ -135,6 +155,26 @@ class Panel:
         ext = "right-to-left" if self._flags & 0x01 else "left-to-right"
         freq = "bottom" if self._flags & 0x02 else "top"
         print(f"  Panel {self.port}: connected (bars {ext}, low-freq at {freq})")
+        self._connected = True
+
+    def try_reconnect(self, available_ports: list[str]) -> bool:
+        """Attempt to reconnect, preferring the originally configured port.
+
+        *available_ports* should exclude ports already claimed by other panels.
+        Returns True on success.
+        """
+        candidates = []
+        if self._configured_port in available_ports:
+            candidates.append(self._configured_port)
+        candidates += [p for p in available_ports if p not in candidates]
+        for port in candidates:
+            try:
+                self.port = port
+                self.connect()
+                return True
+            except serial.SerialException:
+                self._connected = False
+        return False
 
     @staticmethod
     def _pack_nibbles(values: list[int]) -> bytes:
@@ -143,6 +183,8 @@ class Panel:
         return (arr[0::2] | (arr[1::2] << 4)).tobytes()
 
     def send_eq(self, heights: list[int], peaks: list[int], peak_brightness: list[int]) -> None:
+        if not self._connected:
+            return  # skip until reconnect succeeds
         h = [max(0, min(BAR_MAX, v)) for v in heights[:NUM_BANDS]]
         p = [max(0, min(BAR_MAX, v)) for v in peaks[:NUM_BANDS]]
         # Convert brightness 0-255 → nibble 0-15; firmware decodes as nibble * 17
@@ -154,7 +196,7 @@ class Panel:
         cmd = MAGIC + bytes([CMD_DISPLAY_EQ]) + self._pack_nibbles(h) + self._pack_nibbles(p) + self._pack_nibbles(b)
         with self._lock:
             if self._ser and self._ser.is_open:
-                # Retry up to 3 times on timeout; skip warnings after first failure to avoid spam
+                # Retry up to 3 times on timeout; mark disconnected on persistent failure
                 for attempt in range(3):
                     try:
                         self._ser.write(cmd)
@@ -164,9 +206,11 @@ class Panel:
                             print(f"  Warning: serial write to {self.port} attempt {attempt+1} failed: {exc} — retrying…")
                             time.sleep(0.05)  # brief pause before retry
                         else:
-                            print(f"  Warning: serial write to {self.port} failed after 3 attempts: {exc}")
+                            print(f"  Panel {self.port} lost — will attempt reconnect…")
+                            self._connected = False
 
     def close(self) -> None:
+        self._connected = False
         if self._ser and self._ser.is_open:
             self._ser.close()
 
@@ -248,6 +292,10 @@ _EXCLUDED_DEVICE_PATTERNS = [
     "easy effects filter",
     "easyeffects filter",
     "spectrum",
+    # Raw ALSA hardware devices (e.g. "HD-Audio Generic: ALC295 Analog (hw:2,0)").
+    # PipeWire holds exclusive access to these; probing them with rapid open/close
+    # cycles eventually triggers a PortAudio internal assertion (SIGABRT).
+    "(hw:",
 ]
 
 def _is_microphone(name: str) -> bool:
@@ -302,7 +350,7 @@ class _ProbeDevice:
         result = {"energy": 0.0}
 
         def _cb(indata, frames, time_info, status):
-            if status and "input overflow" not in status and "output underflow" not in status:
+            if status and "input overflow" not in str(status) and "output underflow" not in str(status):
                 print(f"  [probe] status for {self.device}: {status}")
             if indata.ndim < 2 or indata.shape[1] < 1:
                 return
@@ -364,8 +412,11 @@ class _ProbeDevice:
                         print(f"  [probe] failed to open device {self.name} (stereo+mono)")
                         return
 
-                    time.sleep(0.5)
+                # Release the stderr lock while the stream runs (0.5 s sleep)
+                # so main-thread device-switch calls to _suppress_stderr don't block.
+                time.sleep(0.5)
 
+                with _suppress_stderr():
                     stream.stop()
                     stream.close()
                     stream = None
@@ -1254,6 +1305,35 @@ class AudioVisualizer:
             self._rebuild_fft_bins(all_masks[self._bass_skip:])
 
     # ------------------------------------------------------------------
+    # Panel reconnection
+    # ------------------------------------------------------------------
+
+    def _reconnect_panels(self) -> None:
+        """Try to reconnect any panels that lost their serial connection.
+
+        Called periodically from the main loop.  Scans /dev/ttyACM* and
+        /dev/ttyUSB* for available ports, excluding ones already owned by
+        healthy panels, then lets each disconnected panel attempt to claim
+        one (preferring its originally configured path).
+        """
+        disconnected = [p for p in self._panels if not p.is_connected]
+        if not disconnected:
+            return
+
+        all_ports = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
+        in_use = {p.port for p in self._panels if p.is_connected}
+        available = [p for p in all_ports if p not in in_use]
+
+        if not available:
+            return  # nothing to try yet — device hasn't re-enumerated
+
+        for panel in disconnected:
+            if panel.try_reconnect(available):
+                available = [p for p in available if p != panel.port]
+            else:
+                print(f"  Panel (was {panel._configured_port}): no usable port found — will retry")
+
+    # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
@@ -1344,9 +1424,17 @@ class AudioVisualizer:
             self._rebuild_fft_bins(all_masks[self._bass_skip:])
 
         last_frame = time.monotonic()
+        last_reconnect_check = 0.0
+        _RECONNECT_INTERVAL = 5.0  # seconds between panel reconnect attempts
 
         try:
             while True:
+                # Periodically probe for disconnected panels (sleep/wake device remapping)
+                now = time.monotonic()
+                if now - last_reconnect_check >= _RECONNECT_INTERVAL:
+                    last_reconnect_check = now
+                    self._reconnect_panels()
+
                 # Check for auto-switch signal (non-blocking)
                 # wait_for_switch returns True only when a new switch is signalled
                 # and clears the event, so repeated calls won't re-trigger.

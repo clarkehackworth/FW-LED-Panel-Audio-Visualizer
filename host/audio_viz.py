@@ -34,8 +34,6 @@ from __future__ import annotations
 
 import argparse
 
-import glob
-
 import os
 
 import queue
@@ -55,6 +53,7 @@ from typing import Optional
 import numpy as np
 
 import serial
+import serial.tools.list_ports
 
 import sounddevice as sd
 
@@ -94,6 +93,9 @@ def _suppress_stderr():
 # Protocol constants
 # ---------------------------------------------------------------------------
 
+PANEL_USB_VID = 0x32AC
+PANEL_USB_PID = 0x0020
+
 MAGIC = bytes([0x32, 0xAC])
 CMD_SET_EQ_CONFIG = 0x1D
 CMD_DISPLAY_EQ = 0x21
@@ -102,6 +104,14 @@ PANEL_WIDTH = 9    # firmware cols — bar height axis, 0-9 (physical top-bottom
 PANEL_HEIGHT = 34  # firmware rows — frequency band axis, 0-33 (physical right-left)
 NUM_BANDS = PANEL_HEIGHT   # one frequency band per firmware row
 BAR_MAX   = PANEL_WIDTH    # max bar height value sent to firmware
+
+
+def _find_panel_ports() -> list[str]:
+    """Return sorted serial port paths for connected Framework LED Matrix panels."""
+    return sorted(
+        p.device for p in serial.tools.list_ports.comports()
+        if p.vid == PANEL_USB_VID and p.pid == PANEL_USB_PID
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -126,23 +136,11 @@ class Panel:
     def is_connected(self) -> bool:
         return self._connected
 
-    def connect(self) -> None:
-        # Close any stale handle before (re)opening
-        if self._ser is not None:
-            try:
-                self._ser.close()
-            except Exception:
-                pass
-        self._ser = serial.Serial(self.port, 115200, timeout=0.1, write_timeout=2.0)
-        # Flush any stale data from the device
-        self._ser.reset_input_buffer()
-        self._ser.reset_output_buffer()
+    def _send_config(self) -> None:
         cfg_cmd = MAGIC + bytes([CMD_SET_EQ_CONFIG, self._flags, self._fade_min])
-        # Retry config handshake up to 3 times
         for attempt in range(3):
             try:
                 self._ser.write(cfg_cmd)
-                # Small delay to let device process the config
                 self._ser.in_waiting  # force read-check
                 break
             except serial.SerialException as exc:
@@ -152,6 +150,18 @@ class Panel:
                     self._ser.reset_output_buffer()
                 else:
                     print(f"  Warning: config write to {self.port} failed after 3 attempts: {exc}")
+
+    def connect(self) -> None:
+        # Close any stale handle before (re)opening
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+        self._ser = serial.Serial(self.port, 115200, timeout=0.1, write_timeout=2.0)
+        self._ser.reset_input_buffer()
+        self._ser.reset_output_buffer()
+        self._send_config()
         ext = "right-to-left" if self._flags & 0x01 else "left-to-right"
         freq = "bottom" if self._flags & 0x02 else "top"
         print(f"  Panel {self.port}: connected (bars {ext}, low-freq at {freq})")
@@ -1320,7 +1330,7 @@ class AudioVisualizer:
         if not disconnected:
             return
 
-        all_ports = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
+        all_ports = _find_panel_ports()
         in_use = {p.port for p in self._panels if p.is_connected}
         available = [p for p in all_ports if p not in in_use]
 
@@ -1343,20 +1353,34 @@ class AudioVisualizer:
             sys.exit(1)
 
         print("Connecting to panels...")
+        all_ports = _find_panel_ports()
+        claimed: set[str] = set()
         for panel in self._panels:
-            try:
-                panel.connect()
-            except serial.SerialException as e:
-                port_name = panel.port if hasattr(panel, "port") else "unknown"
-                print(f"ERROR: could not open panel port {port_name}: {e}")
-                # Show available serial devices
-                available = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
-                if available:
-                    print(f"Available serial devices: {', '.join(available)}")
+            available = [p for p in all_ports if p not in claimed]
+            if not panel.try_reconnect(available):
+                print(f"ERROR: could not connect panel (configured port: {panel._configured_port})")
+                if all_ports:
+                    print(f"Available serial devices: {', '.join(all_ports)}")
                 else:
                     print("No serial devices found. Check that panels are connected and recognized by the system.")
                 print("Update the port in config.yaml or pass --left / --right on the command line.")
                 sys.exit(1)
+            if panel.port != panel._configured_port:
+                print(f"  Note: {panel._configured_port} not found; auto-assigned to {panel.port}")
+            claimed.add(panel.port)
+
+        # Assign left/right roles and bar directions by port sort order:
+        # lower port → left panel (right-to-left bars), higher → right panel (left-to-right bars)
+        if len(self._panels) == 2:
+            sorted_panels = sorted(self._panels, key=lambda p: p.port)
+            dir_bits = [1, 0]  # lower=right-to-left, higher=left-to-right
+            for panel, dir_bit in zip(sorted_panels, dir_bits):
+                new_flags = (panel._flags & ~0x01) | dir_bit
+                if new_flags != panel._flags:
+                    panel._flags = new_flags
+                    panel._send_config()
+            self._left_panel  = sorted_panels[0]
+            self._right_panel = sorted_panels[1]
 
         device = self._find_device()
         sample_rate = self._resolve_sample_rate(device)
@@ -1450,7 +1474,14 @@ class AudioVisualizer:
                         new_device = new_probe.device
                         new_name = new_probe.name
                         self._stream.stop()
-                        self._switch_device(new_device, new_name)
+                        try:
+                            self._switch_device(new_device, new_name)
+                        except Exception as e:
+                            print(f"  ERROR: Failed to switch to device {new_name}: {e}")
+                            # If the switch failed, we may have closed the old stream.
+                            # We attempt to recover by reopening the previous device if possible.
+                            # For now, we just log and wait for the next monitor cycle.
+                            continue
                         # Sync the main-loop probe pointer and start the persistence
                         # lock from this moment so the monitor doesn't re-probe.
                         self._current_probe = probe_map[new_device]
@@ -1591,6 +1622,13 @@ def main() -> None:
         if args.config != "config.yaml":
             print(f"WARNING: config file not found: {cfg_path}")
         cfg = {}
+
+    # Auto-assign ports from detected panels if not set in config or CLI
+    detected = _find_panel_ports()
+    if not cfg.get("left_panel", {}).get("port") and not args.left and len(detected) >= 1:
+        cfg.setdefault("left_panel", {})["port"] = detected[0]
+    if not cfg.get("right_panel", {}).get("port") and not args.right and len(detected) >= 2:
+        cfg.setdefault("right_panel", {})["port"] = detected[1]
 
     # CLI overrides
     if args.left:

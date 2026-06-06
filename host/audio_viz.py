@@ -324,6 +324,33 @@ def _is_excluded_device(name: str) -> bool:
     lower = name.lower()
     return any(pat in lower for pat in _EXCLUDED_DEVICE_PATTERNS)
 
+def _is_pipewire_per_app_source(dev: dict) -> bool:
+    """Return True if this is a PipeWire per-app client source.
+
+    These devices (e.g. 'Firefox', 'Godot Engine Editor', 'speech-dispatcher-dummy')
+    appear as input devices with 0 output channels via the PipeWire host API.
+    They work for audio routing but return silence when monitored via PortAudio/ALSA,
+    because the per-app capture feature requires direct PipeWire API access.
+    The system-wide output monitor already captures all app audio, so these are
+    redundant and misleading as auto-switch candidates.
+    """
+    # PipeWire host API (hostapi=2 on Linux) with input-only and an app-like name.
+    if dev.get("hostapi") != 2:
+        return False
+    if dev["max_output_channels"] > 0:
+        return False
+    # Skip hardware audio devices that happen to be on the PipeWire host API
+    # (e.g. "Ryzen HD Audio Controller Analog Stereo" which has outputs).
+    hw_keywords = [
+        "audio controller", "hd audio", "hdmi", "dp-", "displayport",
+        "realtek", "alc", "hdmi", "codec", "analog stereo",
+    ]
+    lower = dev["name"].lower()
+    if any(kw in lower for kw in hw_keywords):
+        return False
+    return True
+
+
 
 # ---------------------------------------------------------------------------
 # PortAudio re-init helper (forces device list refresh)
@@ -369,6 +396,13 @@ class _ProbeDevice:
         def _resolve_device():
             """Resolve a device identifier (index or name) to what sounddevice accepts."""
             dev = self.device
+            # None (Python None) means "use sounddevice default" — pass through.
+            if dev is None:
+                return None
+            # The literal string 'None' can appear if a config value or CLI
+            # arg was the word "none" — treat it the same as Python None.
+            if isinstance(dev, str) and dev.lower() == "none":
+                return None
             if isinstance(dev, int):
                 return dev
             # String name — verify it matches a real PortAudio input device.
@@ -552,6 +586,8 @@ class AudioMonitor:
             if not self._allow_mics and _is_microphone(dev["name"]):
                 continue
             if _is_excluded_device(dev["name"]):
+                continue
+            if _is_pipewire_per_app_source(dev):
                 continue
             pa_new_candidates.append((dev["index"], dev["name"]))
 
@@ -1176,6 +1212,9 @@ class AudioVisualizer:
         The "default" sounddevice device is included when the initial device is
         not the default, because pactl may have configured it to point at the
         output monitor — making it the best fallback for system-audio capture.
+
+        PipeWire per-app client sources (e.g. "Firefox", "Godot") are excluded
+        because they return silence when monitored via PortAudio/ALSA.
         """
         candidates: list[tuple[object, str]] = []
         devices = sd.query_devices()
@@ -1196,6 +1235,8 @@ class AudioVisualizer:
             if not self._allow_mics and _is_microphone(dev["name"]):
                 continue
             if _is_excluded_device(dev["name"]):
+                continue
+            if _is_pipewire_per_app_source(dev):
                 continue
             candidates.append((dev["index"], dev["name"]))
 

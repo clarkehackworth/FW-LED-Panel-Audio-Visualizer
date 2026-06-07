@@ -1385,47 +1385,37 @@ class AudioVisualizer:
                 print(f"  Panel (was {panel._configured_port}): no usable port found — will retry")
 
     # ------------------------------------------------------------------
-    # Main loop
+    # Audio capture (re)build  — used at startup and on default-sink change
     # ------------------------------------------------------------------
 
-    def run(self) -> None:
-        if not self._panels:
-            print("ERROR: no panels configured. Set left_panel.port / right_panel.port in config.yaml")
-            sys.exit(1)
+    @staticmethod
+    def _get_default_sink() -> Optional[str]:
+        """Return the current PipeWire/PulseAudio default sink name, or None.
 
-        print("Connecting to panels...")
-        all_ports = _find_panel_ports()
-        claimed: set[str] = set()
-        for panel in self._panels:
-            available = [p for p in all_ports if p not in claimed]
-            if not panel.try_reconnect(available):
-                print(f"ERROR: could not connect panel (configured port: {panel._configured_port})")
-                if all_ports:
-                    print(f"Available serial devices: {', '.join(all_ports)}")
-                else:
-                    print("No serial devices found. Check that panels are connected and recognized by the system.")
-                print("Update the port in config.yaml or pass --left / --right on the command line.")
-                sys.exit(1)
-            if panel.port != panel._configured_port:
-                print(f"  Note: {panel._configured_port} not found; auto-assigned to {panel.port}")
-            claimed.add(panel.port)
+        Used to detect output-device changes (headphones plugged in, sleep/wake
+        remapping, Bluetooth) so we can refresh PortAudio's frozen device list.
+        """
+        try:
+            import subprocess
+            r = subprocess.run(
+                ["pactl", "get-default-sink"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+        except Exception:
+            pass
+        return None
 
-        # Assign left/right roles and bar directions by port sort order:
-        # lower port → left panel (right-to-left bars), higher → right panel (left-to-right bars)
-        if len(self._panels) == 2:
-            sorted_panels = sorted(self._panels, key=lambda p: p.port)
-            dir_bits = [1, 0]  # lower=right-to-left, higher=left-to-right
-            for panel, dir_bit in zip(sorted_panels, dir_bits):
-                new_flags = (panel._flags & ~0x01) | dir_bit
-                if new_flags != panel._flags:
-                    panel._flags = new_flags
-                    panel._send_config()
-            self._left_panel  = sorted_panels[0]
-            self._right_panel = sorted_panels[1]
+    def _build_audio_capture(self):
+        """Discover the audio device, build probes + monitor, and open the stream.
 
+        Sets self._stream and self._current_probe.  Returns
+        (device, monitor, monitor_thread, probe_map).  Safe to call repeatedly —
+        _reinit_audio() uses it to rebuild capture after the default sink changes.
+        """
         device = self._find_device()
         sample_rate = self._resolve_sample_rate(device)
-        frame_interval = 1.0 / self._target_fps
 
         # Build probes FIRST so the callback can track energy from the start
         current_probe: Optional[_ProbeDevice] = None
@@ -1476,7 +1466,7 @@ class AudioVisualizer:
         # sees a non-None _current_probe on its very first invocation.
         self._current_probe = current_probe
 
-        # Open the initial audio stream (must happen before main loop)
+        # Open the audio stream (must happen before the main loop processes frames)
         stream, actual_rate = self._open_stream(device, sample_rate)
         self._stream = stream
         if actual_rate != sample_rate:
@@ -1488,9 +1478,98 @@ class AudioVisualizer:
             )
             self._rebuild_fft_bins(all_masks[self._bass_skip:])
 
+        return device, monitor, monitor_thread, probe_map
+
+    def _reinit_audio(self, old_monitor: Optional[AudioMonitor]):
+        """Tear down PortAudio and rebuild capture from scratch.
+
+        PortAudio snapshots its device list at Pa_Initialize() and never updates
+        it, so devices that appear after startup (headphones, Bluetooth, sleep/wake
+        re-enumeration) are invisible to sd.query_devices().  Terminating and
+        re-initializing forces a fresh snapshot; _build_audio_capture() then
+        re-points pactl at the new default sink's monitor and rebuilds probes.
+        """
+        # Stop the old monitor thread and wait for any in-flight probe streams to
+        # finish before we pull PortAudio out from under them.
+        if old_monitor is not None:
+            old_monitor.stop()
+            if old_monitor._switch_event is not None:
+                old_monitor._switch_event.set()  # wake it from its interval wait
+            thread = getattr(old_monitor, "_thread", None)
+            if thread is not None:
+                thread.join(timeout=10.0)
+
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        self._current_probe = None
+
+        # Refresh PortAudio's device snapshot.
+        try:
+            with _suppress_stderr():
+                sd._terminate()
+                sd._initialize()
+        except Exception as e:
+            print(f"  Warning: PortAudio re-init failed: {e}")
+
+        return self._build_audio_capture()
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
+    def run(self) -> None:
+        if not self._panels:
+            print("ERROR: no panels configured. Set left_panel.port / right_panel.port in config.yaml")
+            sys.exit(1)
+
+        print("Connecting to panels...")
+        all_ports = _find_panel_ports()
+        claimed: set[str] = set()
+        for panel in self._panels:
+            available = [p for p in all_ports if p not in claimed]
+            if not panel.try_reconnect(available):
+                print(f"ERROR: could not connect panel (configured port: {panel._configured_port})")
+                if all_ports:
+                    print(f"Available serial devices: {', '.join(all_ports)}")
+                else:
+                    print("No serial devices found. Check that panels are connected and recognized by the system.")
+                print("Update the port in config.yaml or pass --left / --right on the command line.")
+                sys.exit(1)
+            if panel.port != panel._configured_port:
+                print(f"  Note: {panel._configured_port} not found; auto-assigned to {panel.port}")
+            claimed.add(panel.port)
+
+        # Assign left/right roles and bar directions by port sort order:
+        # lower port → left panel (right-to-left bars), higher → right panel (left-to-right bars)
+        if len(self._panels) == 2:
+            sorted_panels = sorted(self._panels, key=lambda p: p.port)
+            dir_bits = [1, 0]  # lower=right-to-left, higher=left-to-right
+            for panel, dir_bit in zip(sorted_panels, dir_bits):
+                new_flags = (panel._flags & ~0x01) | dir_bit
+                if new_flags != panel._flags:
+                    panel._flags = new_flags
+                    panel._send_config()
+            self._left_panel  = sorted_panels[0]
+            self._right_panel = sorted_panels[1]
+
+        frame_interval = 1.0 / self._target_fps
+
+        device, monitor, monitor_thread, probe_map = self._build_audio_capture()
+
         last_frame = time.monotonic()
         last_reconnect_check = 0.0
         _RECONNECT_INTERVAL = 5.0  # seconds between panel reconnect attempts
+
+        # Track the default output sink so we can refresh PortAudio's frozen
+        # device list when audio routing changes (headphones, sleep/wake, BT).
+        last_sink = self._get_default_sink()
+        last_sink_check = time.monotonic()
+        _SINK_CHECK_INTERVAL = 3.0  # seconds between default-sink polls
 
         try:
             while True:
@@ -1499,6 +1578,20 @@ class AudioVisualizer:
                 if now - last_reconnect_check >= _RECONNECT_INTERVAL:
                     last_reconnect_check = now
                     self._reconnect_panels()
+
+                # Detect default-sink changes (headphones plugged in, sleep/wake,
+                # Bluetooth) and rebuild capture so the new output monitor — which
+                # PortAudio can't see in its boot-time snapshot — becomes usable.
+                if now - last_sink_check >= _SINK_CHECK_INTERVAL:
+                    last_sink_check = now
+                    cur_sink = self._get_default_sink()
+                    if cur_sink is not None and cur_sink != last_sink:
+                        print(f"  Default audio sink changed: {last_sink} -> {cur_sink} "
+                              f"— re-detecting audio devices…")
+                        last_sink = cur_sink
+                        device, monitor, monitor_thread, probe_map = self._reinit_audio(monitor)
+                        last_frame = time.monotonic()
+                        continue
 
                 # Check for auto-switch signal (non-blocking)
                 # wait_for_switch returns True only when a new switch is signalled

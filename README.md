@@ -1,5 +1,7 @@
 # Framework LED Matrix Audio Visualizer
 
+![Demo](assets/demo.gif)
+
 Real-time FFT frequency-bar visualizer for the Framework 16 LED input-module
 panels.  Both left and right panels display the same audio spectrum; the bar
 direction on each side is mirrored and configurable at runtime.

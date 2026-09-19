@@ -1,1 +1,3 @@
 firmware/inputmodule-rs/
+__pycache__/
+.serena/

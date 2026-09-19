@@ -77,21 +77,21 @@ visualization:
 
   # dB range mapped to full bar height.  Raise db_ceiling to compress loud peaks;
   # lower db_floor to show quieter signals.
-  db_floor: -60          # dB — maps to bar length 0 (silence)
-  db_ceiling: -10        # dB — maps to bar length 8 (full)
+  db_floor: -100         # dB — maps to bar length 0 (silence)
+  db_ceiling: -25       # dB — maps to bar length 8 (full)
 
   # Smoothing: attack controls how fast bars rise; decay controls fall speed.
   # Both are per-frame multipliers (higher = faster for attack, slower for decay).
   scale: 2.0              # gamma/power curve exponent: 1.0 = linear, higher = pull down midrange
                          # (the peak always stays at max; only sub-peak values are compressed)
 
-  attack: 0.5            # 0-1: fraction of new value blended in on the way up
+  attack: 0.25           # 0-1: fraction of new value blended in on the way up
   decay: 0.5            # 0-1: fraction of current value kept each frame on the way down
 
   target_fps: 30         # frames per second sent to panels
 
   # Bar brightness gradient: base is always 255; tip fades to this value (0-255).
-  bar_fade_min: 0
+  bar_fade_min: 100
 
   # Peak indicators — a bright pixel that stays at the widest recent bar position.
   peaks: true

@@ -467,7 +467,11 @@ class _ProbeDevice:
 
                     if buf:
                         samples = np.concatenate(buf)
-                        energy = float(np.sqrt(np.mean(samples ** 2)))
+                        # ponytail: DC-removed RMS. A broken node (PortAudio's
+                        # JACK host API on an unreadable PipeWire node) returns a
+                        # constant rail, e.g. all -1.0 -> raw RMS 1.0, which beats
+                        # every real source and smears across the whole spectrum.
+                        energy = float(np.std(samples))
                         now = time.monotonic()
                         with self._lock:
                             self._energy = energy
@@ -1033,7 +1037,7 @@ class AudioVisualizer:
         # Track current device energy for auto-switch comparison (use L+R mean)
         if self._current_probe is not None:
             mono = (left + right) * 0.5
-            energy = float(np.sqrt(np.mean(mono ** 2)))
+            energy = float(np.std(mono))  # ponytail: DC-removed, see _ProbeDevice.probe
             now = time.monotonic()
             with self._current_probe._lock:
                 self._current_probe._energy = energy

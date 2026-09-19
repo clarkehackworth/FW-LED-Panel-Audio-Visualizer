@@ -308,9 +308,46 @@ _EXCLUDED_DEVICE_PATTERNS = [
     "(hw:",
 ]
 
+_capture_cache: tuple[float, set] = (0.0, set())
+
+def _pactl_capture_names() -> set:
+    """Descriptions of PipeWire sources that are NOT sink monitors, i.e. real
+    capture hardware (mics). PortAudio's JACK host API names its nodes with
+    exactly these descriptions, so this is the authoritative "is it a mic?"
+    answer — no name-pattern guessing.
+
+    ponytail: 5 s TTL so hotplugging a headset is picked up without spawning a
+    subprocess per device per scan. Empty set on any failure (non-PulseAudio
+    systems), which just falls back to the name patterns below.
+    """
+    global _capture_cache
+    now = time.monotonic()
+    if now - _capture_cache[0] < 5.0:
+        return _capture_cache[1]
+    names = set()
+    try:
+        import subprocess
+        out = subprocess.run(["pactl", "list", "sources"], capture_output=True,
+                             text=True, timeout=2).stdout
+        desc = None
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("Description:"):
+                desc = line.split(":", 1)[1].strip()
+            elif line.startswith("Monitor of Sink:"):
+                if line.split(":", 1)[1].strip() == "n/a" and desc:
+                    names.add(desc.lower())
+                desc = None
+    except Exception:
+        pass
+    _capture_cache = (now, names)
+    return names
+
 def _is_microphone(name: str) -> bool:
     """Return True if *name* looks like a microphone / capture device."""
     lower = name.lower()
+    if lower in _pactl_capture_names():
+        return True
     for pat in _MICROPHONE_PATTERNS:
         if pat in lower:
             return True

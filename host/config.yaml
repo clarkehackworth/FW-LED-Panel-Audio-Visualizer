@@ -82,7 +82,7 @@ visualization:
 
   # Smoothing: attack controls how fast bars rise; decay controls fall speed.
   # Both are per-frame multipliers (higher = faster for attack, slower for decay).
-  scale: 16.0             # gamma/power curve exponent: 1.0 = linear, higher = pull down midrange
+  scale: 2.0              # gamma/power curve exponent: 1.0 = linear, higher = pull down midrange
                          # (the peak always stays at max; only sub-peak values are compressed)
 
   attack: 0.5            # 0-1: fraction of new value blended in on the way up

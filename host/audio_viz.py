@@ -981,6 +981,10 @@ class AudioVisualizer:
         self._bass_skip: int = int(viz.get("bass_skip", 6))
 
         self._hann = np.hanning(self._fft_size).astype(np.float32)
+        # Normalise so a full-scale sine reads 0 dBFS. Without this, magnitudes
+        # scale with fft_size (~+48 dB at N=1024), every band pegs at db_ceiling,
+        # and the only way to get dynamics back is an absurd `scale` exponent.
+        self._fft_gain = 2.0 / float(self._hann.sum())
         all_masks = make_log_bins(
             self._num_bars + self._bass_skip, self._freq_min, self._freq_max,
             self._fft_size, self._sample_rate,
@@ -1092,7 +1096,7 @@ class AudioVisualizer:
         `smooth` is updated in-place — pass _smooth_left or _smooth_right.
         """
         windowed = samples * self._hann
-        spectrum = np.abs(np.fft.rfft(windowed, n=self._fft_size))
+        spectrum = np.abs(np.fft.rfft(windowed, n=self._fft_size)) * self._fft_gain
         db = 20.0 * np.log10(spectrum + 1e-10)
 
         valid   = self._bin_assign_valid
@@ -1322,6 +1326,10 @@ class AudioVisualizer:
         )
         self._rebuild_fft_bins(all_masks[self._bass_skip:])
         self._hann = np.hanning(self._fft_size).astype(np.float32)
+        # Normalise so a full-scale sine reads 0 dBFS. Without this, magnitudes
+        # scale with fft_size (~+48 dB at N=1024), every band pegs at db_ceiling,
+        # and the only way to get dynamics back is an absurd `scale` exponent.
+        self._fft_gain = 2.0 / float(self._hann.sum())
         return native
 
     # ------------------------------------------------------------------

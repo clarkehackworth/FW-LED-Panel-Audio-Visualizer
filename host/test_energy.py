@@ -41,5 +41,44 @@ def test_fft_dbfs():
     assert -7.0 < 20 * np.log10(sp2.max()) < -5.0
 
 
+def _load():
+    ns = {}
+    src = open(__file__.replace("test_energy.py", "audio_viz.py")).read()
+    exec(compile(src.split("class AudioVisualizer")[0], "av", "exec"), ns)
+    return ns
+
+
+def test_stale_current_index():
+    """A refresh that shrinks _probes must not IndexError on a stale index."""
+    ns = _load()
+    probe = ns["_ProbeDevice"](0, 48000, 1024)
+    probe.name = "default"
+    mon = ns["AudioMonitor"]([probe], None, 48000, probe_map={})
+    mon._current_index = 5           # points far past the single probe
+    mon._refresh_devices({})         # used to raise IndexError
+    assert mon._current_index < max(len(mon._probes), 1)
+
+    # and with no probes at all
+    mon._probes = []
+    mon._current_index = 3
+    mon._refresh_devices({})
+
+
+def test_pactl_cache_keeps_last_good():
+    """A failed pactl read must not wipe a known-good capture set."""
+    ns = _load()
+    good = {"some microphone"}
+    ns["_capture_cache"] = (0.0, good)          # stale (forces a re-read)
+    import subprocess
+    orig = subprocess.run
+    subprocess.run = lambda *a, **k: (_ for _ in ()).throw(OSError("pactl gone"))
+    try:
+        assert ns["_pactl_capture_names"]() == good
+    finally:
+        subprocess.run = orig
+
+
 if __name__ == "__main__":
-    test(); test_capture_filter(); test_fft_dbfs(); print("ok")
+    test(); test_capture_filter(); test_fft_dbfs()
+    test_stale_current_index(); test_pactl_cache_keeps_last_good()
+    print("ok")

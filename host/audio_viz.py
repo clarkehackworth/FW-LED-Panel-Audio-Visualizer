@@ -316,6 +316,14 @@ def _pactl_capture_names() -> set:
     exactly these descriptions, so this is the authoritative "is it a mic?"
     answer — no name-pattern guessing.
 
+    A sink's monitor and the matching capture device often share one
+    description verbatim (e.g. "Ryzen HD Audio Controller Analog Stereo" is
+    both alsa_output.pci-....monitor and alsa_input.pci-...). PortAudio exposes
+    a single device for that name, so the two are indistinguishable there.
+    Excluding the ambiguous name is the safe resolution: guessing wrong feeds
+    the visualizer microphone noise, and nothing is lost, because the default
+    sink's monitor is always reachable through the "default" device.
+
     ponytail: 5 s TTL so hotplugging a headset is picked up without spawning a
     subprocess per device per scan. Empty set on any failure (non-PulseAudio
     systems), which just falls back to the name patterns below.
@@ -340,6 +348,11 @@ def _pactl_capture_names() -> set:
                 desc = None
     except Exception:
         pass
+    # A failed or empty read (pactl timing out while the default sink churns)
+    # must not replace a known-good set — an empty set silently re-admits every
+    # microphone. Keep the last good answer and retry on the next call.
+    if not names and _capture_cache[1]:
+        return _capture_cache[1]
     _capture_cache = (now, names)
     return names
 
@@ -633,6 +646,10 @@ class AudioMonitor:
             pa_new_candidates.append((dev["index"], dev["name"]))
 
         # Build a set of candidate device indices (excluding the current one).
+        # ponytail: clamp — a previous refresh can shrink _probes (a device went
+        # away) while _current_index still points past the end. Fix the attribute,
+        # not just the local, so later readers see a valid index too.
+        self._current_index = max(0, min(self._current_index, len(self._probes) - 1))
         current_idx = self._current_index
         current_device = self._probes[current_idx].device if self._probes else None
 

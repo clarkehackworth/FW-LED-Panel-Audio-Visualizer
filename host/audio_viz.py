@@ -1137,8 +1137,10 @@ class AudioVisualizer:
         smooth[~rising] *= self._decay
 
         # Bars use gamma curve; peaks stay linear so they always reach full brightness
-        bars  = np.clip((smooth ** self._scale * BAR_MAX).astype(int), 0, BAR_MAX)
-        peaks = np.clip((smooth * BAR_MAX).astype(int), 0, BAR_MAX)
+        # Round, don't truncate: the attack filter approaches 1.0 asymptotically,
+        # so int() capped every bar at BAR_MAX-1 and the top row never lit.
+        bars  = np.clip(np.rint(smooth ** self._scale * BAR_MAX), 0, BAR_MAX).astype(int)
+        peaks = np.clip(np.rint(smooth * BAR_MAX), 0, BAR_MAX).astype(int)
         return bars, peaks
 
     # ------------------------------------------------------------------

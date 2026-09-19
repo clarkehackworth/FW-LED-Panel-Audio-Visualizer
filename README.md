@@ -63,7 +63,8 @@ Edit `host/config.yaml`:
   - **Linux**: find them with `ls /dev/ttyACM*` (plug/unplug to identify which is which).
   - **Windows**: find them in Device Manager → Ports (COM & LPT) — look for `COMx`.
 - Set `left_panel.direction` and `right_panel.direction` (`left` or `right`).
-- Adjust `num_bars`, `freq_min/max`, `decay`, `attack`, `target_fps` to taste.
+- Adjust `num_bars`, `freq_min/max`, `target_fps` to taste; see
+  [Tuning tips](#tuning-tips) for the dB range and smoothing settings.
 
 #### Audio source
 
@@ -139,8 +140,24 @@ ledpanels/
 
 ## Tuning tips
 
-- **Bass-heavy response**: lower `freq_min` to 40 Hz, raise `db_ceiling` to -5.
+The spectrum is normalised to **dBFS** — a full-scale sine reads 0 dB, so
+`db_floor`/`db_ceiling` are absolute and portable across `fft_size` values.
+Typical music sits well below 0: bass around -20 dB, treble around -65 dB.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `db_floor` | `-100` | dB mapped to an empty bar. Raise it to cut quiet detail, lower it to bring faint treble alive. |
+| `db_ceiling` | `-25` | dB mapped to a full bar. Lower it for a hotter, more pegged look. |
+| `scale` | `2.0` | Gamma on the bar fill. `1.0` linear, higher pulls the midrange down. Above ~4 the fill collapses to nothing. |
+| `attack` | `0.25` | Fraction of the new value blended in on the way up. |
+| `decay` | `0.5` | Fraction of the current value kept each frame on the way down. |
+| `bar_fade_min` | `100` | Brightness at the bar tip (base is always 255). `0` = hard fade to black. |
+
+- **Bass-heavy response**: lower `freq_min` to 40 Hz, lower `db_ceiling` to -30.
 - **Snappy attack**: set `attack: 0.95`, `decay: 0.6`.
 - **Smooth, glowing decay**: `attack: 0.85`, `decay: 0.88`.
+- **Bars look dead at the top end**: lower `db_floor` (quiet treble is below it).
+- **Bars pegged at full, blacking out between beats**: raise `db_ceiling` and
+  drop `scale` toward `1.0` — a high gamma on a clipped signal is a cliff.
 - **No peaks, cleaner look**: `peaks: false` or `--no-peaks`.
 - **7 bars with gaps**: `num_bars: 7` — the two rightmost columns will stay dark.
